@@ -1,0 +1,135 @@
+# ==============================================================================
+# Git Ignore - P2P Tunnel Project
+# Bulletproof Security & Production Configuration
+# ==============================================================================
+
+# ------------------------------------------------------------------------------
+# 1. Private Keys, Secrets & Certificates (CRITICAL - Never commit to repo)
+# ------------------------------------------------------------------------------
+keys/
+*.pem
+*.key
+*.pub
+*.id_rsa
+*.id_ed25519
+*.crt
+*.cer
+*.p12
+*.pfx
+
+# ------------------------------------------------------------------------------
+# 2. Configuration & Secrets (Never commit production credentials/history)
+# ------------------------------------------------------------------------------
+config/*.json
+config/*.env
+config/*.yaml
+config/*.yml
+!config/*.example
+!config/*.example.json
+!config/*.json.example
+
+# Environment variable files
+.env
+.env.*
+!.env.example
+
+# ------------------------------------------------------------------------------
+# 3. Internal Agent Documentation & Private Infrastructure Info
+# ------------------------------------------------------------------------------
+gemini.cmd
+GEMINI.md
+AGENTS.md
+MC-AGENTS.md
+
+# ------------------------------------------------------------------------------
+# 4. Build Artifacts, Compilations & Large Binaries
+# ------------------------------------------------------------------------------
+dist/
+build/
+*.spec
+*.exe
+*.dll
+*.so
+*.dylib
+*.bin
+client_version_info.txt
+
+# ------------------------------------------------------------------------------
+# 5. Logs & Lock Files
+# ------------------------------------------------------------------------------
+*.log
+logs/
+server.log
+client.log
+diagnostics/*.log
+*.lock
+server.lock
+
+# ------------------------------------------------------------------------------
+# 6. Python Cache & Virtual Environments
+# ------------------------------------------------------------------------------
+__pycache__/
+**/__pycache__/
+*.py[cod]
+*$py.class
+*.pyd
+
+# Virtual Environments
+.venv/
+venv/
+env/
+ENV/
+env.bak/
+venv.bak/
+
+# Packaging
+*.egg-info/
+.installed.cfg
+*.egg
+
+# ------------------------------------------------------------------------------
+# 7. IDE & Editor Files
+# ------------------------------------------------------------------------------
+.vscode/
+.idea/
+*.sublime-project
+*.sublime-workspace
+*.swp
+*.swo
+*~
+
+# ------------------------------------------------------------------------------
+# 8. OS Generated Files & Corrupted / Trash Files
+# ------------------------------------------------------------------------------
+.DS_Store
+.DS_Store?
+._*
+.Spotlight-V100
+.Trashes
+ehthumbs.db
+Thumbs.db
+Desktop.ini
+'P2P
+'P2P*
+
+# ------------------------------------------------------------------------------
+# 9. Local Tests, Benchmarks & Diagnostics (Excluded from repository)
+# ------------------------------------------------------------------------------
+test_*.py
+spike_test.py
+speed_bench.py
+diagnostics/
+
+# ------------------------------------------------------------------------------
+# 10. Internal Release & Server Maintenance Scripts (Local only)
+# ------------------------------------------------------------------------------
+fix_all.sh
+fix_permissions.sh
+tune_network.sh
+derle_ve_yayinla.bat
+guncellemeleri_sil.bat
+publish.bat
+publish.py
+manage_updates.py
+config/r2_config.json.example
+

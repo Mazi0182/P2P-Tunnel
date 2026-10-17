@@ -1,0 +1,4 @@
+-r requirements.txt
+boto3>=1.28.0
+pyinstaller>=6.0.0
+zstandard>=0.22.0

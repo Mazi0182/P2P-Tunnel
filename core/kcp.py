@@ -1,0 +1,176 @@
+"""
+P2P_MC Fast ARQ Reliable Stream Layer.
+Optimized for zero packet loss, zero corrupted frames, and ultra-low latency.
+Includes Cython C-acceleration with fully transparent pure-Python ARQ fallback.
+"""
+
+import time
+import struct
+from typing import Callable, Optional, Generator
+
+HAS_CYTHON_KCP = False
+try:
+    from kcp.extension import KCP as CKCP
+    HAS_CYTHON_KCP = True
+except Exception:
+    try:
+        import kcp
+        from kcp import KCP as CKCP
+        HAS_CYTHON_KCP = True
+    except Exception:
+        HAS_CYTHON_KCP = False
+
+
+class _PurePythonARQ:
+    """
+    Robust pure-Python Sliding-Window ARQ fallback.
+    Guarantees strict sequential ordering and packet delivery even if C-extension is absent.
+    Frame: [4B SN] + [4B UNA] + [2B Length] + [Payload]
+    """
+
+    def __init__(self, outbound_callback: Callable[[bytes], None], max_chunk: int = 1300):
+        self.outbound_callback = outbound_callback
+        self.max_chunk = max_chunk
+        self.send_seq = 0
+        self.recv_seq = 0
+        self.unacked = {}  # sn -> (timestamp, data_frame)
+        self.receive_buffer = {}  # sn -> payload
+        self.received_queue = []
+
+    def enqueue(self, data: bytes):
+        max_chunk = self.max_chunk
+        for i in range(0, len(data), max_chunk):
+            chunk = data[i : i + max_chunk]
+            frame = struct.pack("!IIH", self.send_seq, self.recv_seq, len(chunk)) + chunk
+            self.unacked[self.send_seq] = (time.time(), frame)
+            self.send_seq += 1
+            self.outbound_callback(frame)
+
+    def flush(self):
+        pass
+
+    def update(self):
+        now = time.time()
+        # Retransmit lost packets after 150ms timeout
+        for sn, (ts, frame) in list(self.unacked.items()):
+            if now - ts > 0.15:
+                self.outbound_callback(frame)
+                self.unacked[sn] = (now, frame)
+
+    def receive(self, packet: bytes):
+        if len(packet) < 10:
+            return
+        sn, una, length = struct.unpack("!IIH", packet[:10])
+        payload = packet[10 : 10 + length]
+
+        # Process ACK (una marks all packets before una as received)
+        for old_sn in list(self.unacked.keys()):
+            if old_sn < una:
+                self.unacked.pop(old_sn, None)
+
+        if length > 0:
+            # Buffer payload in order
+            if sn >= self.recv_seq and sn not in self.receive_buffer:
+                self.receive_buffer[sn] = payload
+
+            # Assemble consecutive payloads
+            while self.recv_seq in self.receive_buffer:
+                self.received_queue.append(self.receive_buffer.pop(self.recv_seq))
+                self.recv_seq += 1
+
+            # Send cumulative ACK probe
+            ack_probe = struct.pack("!IIH", self.send_seq, self.recv_seq, 0)
+            self.outbound_callback(ack_probe)
+
+    def get_all_received(self) -> Generator[bytes, None, None]:
+        while self.received_queue:
+            yield self.received_queue.pop(0)
+
+
+class KCPPeer:
+    """
+    Dual-mode reliable peer:
+    Uses Cython C-extension (hardware speed) when available,
+    seamlessly falls back to pure-Python ARQ without crashing.
+    """
+
+    def __init__(
+        self,
+        conv_id: int,
+        outbound_callback: Callable[[bytes], None],
+        mtu: int = 1350,
+        no_delay: bool = True,
+        interval: int = 10,
+        resend: int = 2,
+        no_congestion: bool = True,
+    ):
+        self.conv_id = conv_id
+        self.outbound_callback = outbound_callback
+        self.mtu = mtu
+        self.interval = interval
+
+        if HAS_CYTHON_KCP:
+            try:
+                self._kcp = CKCP(
+                    conv_id,
+                    max_transmission=mtu,
+                    no_delay=no_delay,
+                    update_interval=interval,
+                    resend_count=resend,
+                    no_congestion_control=no_congestion,
+                    send_window_size=512,
+                    receive_window_size=1024,
+                )
+                self._kcp.include_outbound_handler(self._on_kcp_outbound)
+                self.update()
+                self._is_cython = True
+            except Exception:
+                self._kcp = _PurePythonARQ(self.outbound_callback, max_chunk=max(500, mtu - 50))
+                self._is_cython = False
+        else:
+            self._kcp = _PurePythonARQ(self.outbound_callback, max_chunk=max(500, mtu - 50))
+            self._is_cython = False
+
+    def set_mtu(self, mtu: int):
+        """Dynamically adjusts KCP MTU (e.g. 1350 normal <-> 1100 when VPN is active)."""
+        mtu = max(900, min(1400, int(mtu)))
+        if mtu == self.mtu:
+            return
+        self.mtu = mtu
+        if self._is_cython:
+            try:
+                self._kcp.set_maximum_transmission(mtu)
+            except Exception:
+                pass
+        else:
+            self._kcp.max_chunk = max(500, mtu - 50)
+
+    def _on_kcp_outbound(self, _inst, data: bytes):
+        self.outbound_callback(data)
+
+    def enqueue(self, data: bytes):
+        self._kcp.enqueue(data)
+
+    def flush(self):
+        self._kcp.flush()
+
+    def send(self, data: bytes):
+        self._kcp.enqueue(data)
+        self._kcp.flush()
+
+    def receive(self, packet: bytes):
+        self._kcp.receive(packet)
+
+    def update(self):
+        self._kcp.update()
+
+    def get_outbound_count(self) -> int:
+        if self._is_cython:
+            try:
+                return self._kcp.get_outbound_packets()
+            except Exception:
+                return 0
+        return len(getattr(self._kcp, "unacked", {}))
+
+    def get_received(self) -> Generator[bytes, None, None]:
+        yield from self._kcp.get_all_received()

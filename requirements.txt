@@ -1,0 +1,4 @@
+cryptography>=41.0.0
+kcp>=0.1.6
+PyQt6>=6.5.0
+psutil>=5.9.0
