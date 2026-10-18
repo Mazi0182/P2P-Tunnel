@@ -1,5 +1,5 @@
 """
-P2P_MC Fast ARQ Reliable Stream Layer.
+P2P Tunnel Fast ARQ Reliable Stream Layer.
 Optimized for zero packet loss, zero corrupted frames, and ultra-low latency.
 Includes Cython C-acceleration with fully transparent pure-Python ARQ fallback.
 """
@@ -21,30 +21,62 @@ except Exception:
         HAS_CYTHON_KCP = False
 
 
+KCP_HEADER_STRUCT = struct.Struct("<IBBHIIII")
+KCP_HEADER_SIZE = 24
+
+IKCP_CMD_PUSH = 81
+IKCP_CMD_ACK = 82
+IKCP_CMD_WASK = 83
+IKCP_CMD_WINS = 84
+
+
 class _PurePythonARQ:
     """
     Robust pure-Python Sliding-Window ARQ fallback.
-    Guarantees strict sequential ordering and packet delivery even if C-extension is absent.
-    Frame: [4B SN] + [4B UNA] + [2B Length] + [Payload]
+    100% wire-compatible with standard C-KCP (24-byte little-endian header <IBBHIIII).
+    Allows seamless interoperability between Cython C-KCP and pure-Python peers.
     """
 
-    def __init__(self, outbound_callback: Callable[[bytes], None], max_chunk: int = 1300):
-        self.outbound_callback = outbound_callback
-        self.max_chunk = max_chunk
+    def __init__(
+        self,
+        conv_or_cb,
+        outbound_callback: Optional[Callable[[bytes], None]] = None,
+        max_chunk: int = 1300,
+    ):
+        if callable(conv_or_cb):
+            self.conv_id = 2026
+            self.outbound_callback = conv_or_cb
+        else:
+            self.conv_id = int(conv_or_cb)
+            self.outbound_callback = outbound_callback
+        self.max_chunk = max(500, max_chunk)
         self.send_seq = 0
         self.recv_seq = 0
+        self.wnd = 512
         self.unacked = {}  # sn -> (timestamp, data_frame)
         self.receive_buffer = {}  # sn -> payload
         self.received_queue = []
 
     def enqueue(self, data: bytes):
         max_chunk = self.max_chunk
+        now_ts = int(time.time() * 1000) & 0xFFFFFFFF
         for i in range(0, len(data), max_chunk):
             chunk = data[i : i + max_chunk]
-            frame = struct.pack("!IIH", self.send_seq, self.recv_seq, len(chunk)) + chunk
+            header = KCP_HEADER_STRUCT.pack(
+                self.conv_id,
+                IKCP_CMD_PUSH,
+                0,              # frg
+                self.wnd,       # wnd
+                now_ts,         # ts
+                self.send_seq,  # sn
+                self.recv_seq,  # una
+                len(chunk),     # len
+            )
+            frame = header + chunk
             self.unacked[self.send_seq] = (time.time(), frame)
-            self.send_seq += 1
-            self.outbound_callback(frame)
+            self.send_seq = (self.send_seq + 1) & 0xFFFFFFFF
+            if self.outbound_callback:
+                self.outbound_callback(frame)
 
     def flush(self):
         pass
@@ -54,33 +86,70 @@ class _PurePythonARQ:
         # Retransmit lost packets after 150ms timeout
         for sn, (ts, frame) in list(self.unacked.items()):
             if now - ts > 0.15:
-                self.outbound_callback(frame)
+                if self.outbound_callback:
+                    self.outbound_callback(frame)
                 self.unacked[sn] = (now, frame)
 
     def receive(self, packet: bytes):
-        if len(packet) < 10:
-            return
-        sn, una, length = struct.unpack("!IIH", packet[:10])
-        payload = packet[10 : 10 + length]
+        pkt_len = len(packet)
+        offset = 0
+        while offset + KCP_HEADER_SIZE <= pkt_len:
+            conv, cmd, frg, wnd, ts, sn, una, length = KCP_HEADER_STRUCT.unpack_from(packet, offset)
+            offset += KCP_HEADER_SIZE
+            if offset + length > pkt_len:
+                break
+            payload = packet[offset : offset + length]
+            offset += length
 
-        # Process ACK (una marks all packets before una as received)
-        for old_sn in list(self.unacked.keys()):
-            if old_sn < una:
-                self.unacked.pop(old_sn, None)
+            if self.conv_id == 0 or conv == self.conv_id:
+                self.conv_id = conv
 
-        if length > 0:
-            # Buffer payload in order
-            if sn >= self.recv_seq and sn not in self.receive_buffer:
-                self.receive_buffer[sn] = payload
+            # Process cumulative ACK una: all packets strictly before una are acknowledged
+            for old_sn in list(self.unacked.keys()):
+                if (una - old_sn) & 0xFFFFFFFF < 0x7FFFFFFF and old_sn != una:
+                    self.unacked.pop(old_sn, None)
 
-            # Assemble consecutive payloads
-            while self.recv_seq in self.receive_buffer:
-                self.received_queue.append(self.receive_buffer.pop(self.recv_seq))
-                self.recv_seq += 1
+            if cmd == IKCP_CMD_ACK:
+                # Direct ACK for segment sn
+                self.unacked.pop(sn, None)
+            elif cmd == IKCP_CMD_PUSH:
+                # Send immediate ACK segment back with received segment's ts
+                ack_seg = KCP_HEADER_STRUCT.pack(
+                    conv,
+                    IKCP_CMD_ACK,
+                    0,
+                    self.wnd,
+                    ts,
+                    sn,
+                    self.recv_seq,
+                    0,
+                )
+                if self.outbound_callback:
+                    self.outbound_callback(ack_seg)
 
-            # Send cumulative ACK probe
-            ack_probe = struct.pack("!IIH", self.send_seq, self.recv_seq, 0)
-            self.outbound_callback(ack_probe)
+                if length > 0:
+                    if sn >= self.recv_seq and sn not in self.receive_buffer:
+                        self.receive_buffer[sn] = payload
+
+                    while self.recv_seq in self.receive_buffer:
+                        self.received_queue.append(self.receive_buffer.pop(self.recv_seq))
+                        self.recv_seq = (self.recv_seq + 1) & 0xFFFFFFFF
+            elif cmd == IKCP_CMD_WASK:
+                wins_seg = KCP_HEADER_STRUCT.pack(
+                    conv,
+                    IKCP_CMD_WINS,
+                    0,
+                    self.wnd,
+                    int(time.time() * 1000) & 0xFFFFFFFF,
+                    0,
+                    self.recv_seq,
+                    0,
+                )
+                if self.outbound_callback:
+                    self.outbound_callback(wins_seg)
+
+    def get_outbound_packets(self) -> int:
+        return len(self.unacked)
 
     def get_all_received(self) -> Generator[bytes, None, None]:
         while self.received_queue:
@@ -125,10 +194,10 @@ class KCPPeer:
                 self.update()
                 self._is_cython = True
             except Exception:
-                self._kcp = _PurePythonARQ(self.outbound_callback, max_chunk=max(500, mtu - 50))
+                self._kcp = _PurePythonARQ(self.conv_id, self.outbound_callback, max_chunk=max(500, mtu - 50))
                 self._is_cython = False
         else:
-            self._kcp = _PurePythonARQ(self.outbound_callback, max_chunk=max(500, mtu - 50))
+            self._kcp = _PurePythonARQ(self.conv_id, self.outbound_callback, max_chunk=max(500, mtu - 50))
             self._is_cython = False
 
     def set_mtu(self, mtu: int):

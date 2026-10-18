@@ -1,5 +1,5 @@
 """
-P2P_MC RFC 5389 STUN Client.
+P2P Tunnel RFC 5389 STUN Client.
 Sorgulanan UDP soketinin CGNAT dışındaki Public IP ve Port bilgisini anında çözer.
 """
 

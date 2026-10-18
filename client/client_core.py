@@ -1,5 +1,5 @@
 r"""
-P2P_MC Client Core Engine.
+P2P Tunnel Client Core Engine.
 Stores persistent settings in C:\ProgramData\P2PTunnel\client_config.json.
 Supports Direct IP:Port and Short Hex Codes.
 """
@@ -77,6 +77,11 @@ class P2PMCClientCore:
         self.signaling: Optional[SignalingClient] = None
         self.loop: Optional[asyncio.AbstractEventLoop] = None
         self.is_connected = False
+        self.tcp_servers: list = []
+        self._manual_disconnect: bool = False
+        self._reconnect_attempts: int = 0
+        self._max_reconnect_attempts: int = 5
+        self._reconnect_task: Optional[asyncio.Task] = None
 
         # Event callbacks
         self.on_state_change: Optional[Callable[[str], None]] = None
@@ -200,6 +205,7 @@ class P2PMCClientCore:
 
     async def connect_async(self):
         """Asynchronous connection flow."""
+        self._manual_disconnect = False
         try:
             client_logger.info(f"Sunucuya bağlanılıyor: {self.server_code}")
             if not self.server_code:
@@ -225,7 +231,7 @@ class P2PMCClientCore:
                 self.auth_token = self.admin_key
                 client_logger.info("Yönetici anahtarı devrede (ADMIN modu talep ediliyor)...")
             else:
-                self.auth_token = parsed.get("tok", self.auth_token)
+                self.auth_token = parsed.get("tok") or self.auth_token or self.config.get("auth_token") or DEFAULT_TOKEN
             self.cipher = PacketCipher(derive_key(self.room_secret))
 
             targets: List[Tuple[str, int]] = []
@@ -277,12 +283,12 @@ class P2PMCClientCore:
                     slan = msg.get("lan_ip")
                     lport = msg.get("local_port")
 
-                    # Check if client and server share the exact same public IP (Local LAN / Same Router)
+                    # Check if client and server share the exact same public IP (Local LAN or CGNAT / Shared VPN)
                     is_same_lan = bool(sip and self.public_endpoint and sip == self.public_endpoint[0])
                     is_same_pc = bool(is_same_lan and slan and slan == my_lan_ip)
 
                     if is_same_lan:
-                        # Local LAN connection: prioritize direct LAN addresses (bypasses router NAT hairpinning drop)
+                        # Local LAN connection: add direct LAN addresses
                         if is_same_pc and lport:
                             cand_pc = ("127.0.0.1", int(lport))
                             if cand_pc not in targets:
@@ -291,20 +297,21 @@ class P2PMCClientCore:
                             cand_lan = (slan, int(lport))
                             if cand_lan not in targets:
                                 targets.insert(0, cand_lan)
-                    else:
-                        # Global WAN / External Internet: Public STUN endpoint is the primary target!
-                        if sip and sport:
-                            cand_wan = (sip, int(sport))
-                            for old in list(targets):
-                                if old[0] == sip and old[1] not in (int(sport), int(lport or 0)):
-                                    targets.remove(old)
-                            if cand_wan not in targets:
-                                targets.insert(0, cand_wan)
-                        # Also target server UDP port on public IP (e.g. 25566) in case router has port-forwarding
-                        if sip and lport and int(lport) != int(sport):
-                            cand_direct = (sip, int(lport))
-                            if cand_direct not in targets:
-                                targets.append(cand_direct)
+
+                    # ALWAYS also add WAN STUN endpoint to support CGNAT & VPN peers sharing the same external IP!
+                    if sip and sport:
+                        cand_wan = (sip, int(sport))
+                        for old in list(targets):
+                            if old[0] == sip and old[1] not in (int(sport), int(lport or 0)):
+                                targets.remove(old)
+                        if cand_wan not in targets:
+                            targets.append(cand_wan)
+
+                    # Also target server UDP port on public IP (e.g. 25566) in case router has port-forwarding
+                    if sip and lport and int(lport) != int(sport):
+                        cand_direct = (sip, int(lport))
+                        if cand_direct not in targets:
+                            targets.append(cand_direct)
 
                     server_endpoint_received = True
 
@@ -357,24 +364,23 @@ class P2PMCClientCore:
 
             self.sock.setblocking(False)
             punched = False
-            syn_pkt = self.cipher.encrypt(b"P2P_MC_PUNCH_SYN")
-            ack_pkt = self.cipher.encrypt(b"P2P_MC_PUNCH_ACK")
+            syn_pkt = self.cipher.encrypt(b"P2P_TUN_PUNCH_SYN")
+            ack_pkt = self.cipher.encrypt(b"P2P_TUN_PUNCH_ACK")
 
             # Build punch candidate list with port deltas for WAN Symmetric NAT penetration
             punch_candidates = list(targets)
-            if not is_same_lan and targets:
-                pri_ip, pri_port = targets[0]
-                for delta in (-2, -1, 1, 2, 3):
-                    dp = pri_port + delta
-                    if 1024 <= dp <= 65535:
-                        cand = (pri_ip, dp)
-                        if cand not in punch_candidates:
-                            punch_candidates.append(cand)
+            for cand_ip, cand_port in list(targets):
+                if cand_ip != "127.0.0.1" and not cand_ip.startswith("192.168.") and not cand_ip.startswith("10."):
+                    for delta in (-2, -1, 1, 2, 3):
+                        dp = cand_port + delta
+                        if 1024 <= dp <= 65535:
+                            cand = (cand_ip, dp)
+                            if cand not in punch_candidates:
+                                punch_candidates.append(cand)
 
             for attempt in range(120):
-                # For LAN clients, avoid pinging WAN hairpin during initial attempts
-                active_targets = targets if (is_same_lan and attempt < 30) else punch_candidates
-                for target in list(active_targets):
+                # Probe all candidates (LAN direct and WAN STUN in parallel)
+                for target in list(punch_candidates):
                     try:
                         self.sock.sendto(syn_pkt, target)
                     except OSError:
@@ -384,7 +390,7 @@ class P2PMCClientCore:
                     try:
                         data, addr = self.sock.recvfrom(2048)
                         dec = self.cipher.decrypt(data)
-                        if dec in (b"P2P_MC_PUNCH_SYN", b"P2P_MC_PUNCH_ACK"):
+                        if dec in (b"P2P_TUN_PUNCH_SYN", b"P2P_TUN_PUNCH_ACK"):
                             for _ in range(4):
                                 self.sock.sendto(ack_pkt, addr)
                             punched = True
@@ -434,6 +440,7 @@ class P2PMCClientCore:
                 is_server=False,
                 auth_token=self.auth_token,
                 client_identity=self.client_identity,
+                room_secret=self.room_secret,
             )
 
             self.tunnel.on_ping_update = self._handle_ping_update
@@ -459,6 +466,7 @@ class P2PMCClientCore:
                 raise ConnectionError("Sunucuya ulaşılamadı veya sunucu kapalı.")
 
             self.is_connected = True
+            self._reconnect_attempts = 0
             self.disconnect_event = asyncio.Event()
 
             assigned_port = int(getattr(self.tunnel, "server_assigned_port", 0) or self.local_game_port or 25565)
@@ -484,30 +492,23 @@ class P2PMCClientCore:
             if self.signaling:
                 self.signaling.stop()
                 self.signaling = None
+            await self._cleanup_resources()
             self.is_connected = False
             self._set_state(f"Hata: {str(e)}")
             if self.on_error:
                 self.on_error(str(e))
 
-    def _on_remote_disconnect(self):
-        if self.loop and self.loop.is_running():
-            asyncio.run_coroutine_threadsafe(self.disconnect_async(reason="Sunucu bağlantıyı sonlandırdı."), self.loop)
-
-    async def disconnect_async(self, reason: str = "Bağlı Değil"):
-        """Gracefully disconnects tunnel and shuts down proxies."""
-        if not self.is_connected and not self.tunnel:
-            return
-
-        self.is_connected = False
-        self._set_state("Bağlantı kesiliyor...")
-
+    async def _cleanup_resources(self):
+        """Immediately closes and releases all local proxies, sockets, and tunnel resources."""
         if self.tunnel:
-            self.tunnel.send_disconnect()
-            await self.tunnel.stop()
+            try:
+                await self.tunnel.stop()
+            except Exception:
+                pass
             self.tunnel = None
 
         if hasattr(self, "tcp_servers"):
-            for srv in self.tcp_servers:
+            for srv in list(self.tcp_servers):
                 try:
                     srv.close()
                     await srv.wait_closed()
@@ -525,6 +526,51 @@ class P2PMCClientCore:
         if hasattr(self, "disconnect_event") and self.disconnect_event:
             self.disconnect_event.set()
 
+    def _on_remote_disconnect(self):
+        if self.loop and self.loop.is_running():
+            asyncio.run_coroutine_threadsafe(self._handle_unexpected_disconnect(), self.loop)
+
+    async def _handle_unexpected_disconnect(self):
+        """Handles remote or network-induced disconnect with automatic reconnection."""
+        await self._cleanup_resources()
+        if self.signaling:
+            self.signaling.stop()
+            self.signaling = None
+        self.is_connected = False
+
+        if not self._manual_disconnect and self._reconnect_attempts < self._max_reconnect_attempts:
+            self._reconnect_attempts += 1
+            retry_msg = f"Bağlantı koptu. Yeniden bağlanılıyor ({self._reconnect_attempts}/{self._max_reconnect_attempts})..."
+            self._set_state(retry_msg)
+            client_logger.info(f"[AUTO-RECONNECT] {retry_msg}")
+            await asyncio.sleep(2.0)
+            if not self._manual_disconnect:
+                self._reconnect_task = asyncio.create_task(self.connect_async())
+        else:
+            self._set_state("Bağlantı kesildi.")
+            if self.on_disconnected:
+                self.on_disconnected()
+
+    async def disconnect_async(self, reason: str = "Bağlı Değil"):
+        """Gracefully disconnects tunnel and shuts down proxies."""
+        self._manual_disconnect = True
+        if self._reconnect_task and not self._reconnect_task.done():
+            self._reconnect_task.cancel()
+            self._reconnect_task = None
+
+        if not self.is_connected and not self.tunnel:
+            return
+
+        self.is_connected = False
+        self._set_state("Bağlantı kesiliyor...")
+
+        if self.tunnel:
+            try:
+                self.tunnel.send_disconnect()
+            except Exception:
+                pass
+
+        await self._cleanup_resources()
         self._set_state(reason)
         if self.on_disconnected:
             self.on_disconnected()

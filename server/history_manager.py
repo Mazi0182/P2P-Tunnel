@@ -55,6 +55,71 @@ class ClientHistoryManager:
         except Exception:
             pass
 
+    def get_or_assign_virtual_ip(self, hwid: str, username: str = "") -> str:
+        """
+        Retrieves or allocates a persistent virtual IP (100.0.0.xxx) per client HWID.
+        Persists across disconnections and server restarts via client_history.json.
+        """
+        hwid_clean = str(hwid or "").strip().upper()
+        user_clean = str(username or "").strip()
+        has_valid_hwid = bool(hwid_clean and len(hwid_clean) > 10)
+        key = hwid_clean if has_valid_hwid else f"USER_{user_clean.lower()}"
+
+        # 1. Check existing record by primary key
+        if key in self._history and self._history[key].get("virtual_ip"):
+            return self._history[key]["virtual_ip"]
+
+        # 2. Search all existing records in case client was keyed differently
+        if has_valid_hwid:
+            for k, entry in self._history.items():
+                if entry.get("hwid", "").upper() == hwid_clean and entry.get("virtual_ip"):
+                    return entry["virtual_ip"]
+        elif user_clean:
+            for k, entry in self._history.items():
+                if entry.get("username", "").lower() == user_clean.lower() and entry.get("virtual_ip"):
+                    return entry["virtual_ip"]
+
+        # 3. Collect all currently assigned virtual IPs
+        assigned = set()
+        for entry in self._history.values():
+            vip = entry.get("virtual_ip")
+            if vip:
+                assigned.add(vip)
+
+        # 4. Allocate lowest available 100.0.0.x starting from 100.0.0.2
+        allocated_ip = None
+        for subnet in range(0, 255):
+            for host in range(2, 255):
+                candidate = f"100.0.{subnet}.{host}"
+                if candidate not in assigned:
+                    allocated_ip = candidate
+                    break
+            if allocated_ip:
+                break
+
+        if not allocated_ip:
+            allocated_ip = "100.0.0.2"
+
+        # 5. Store and persist
+        if key in self._history:
+            self._history[key]["virtual_ip"] = allocated_ip
+        else:
+            now_iso = datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+            self._history[key] = {
+                "key": key,
+                "username": user_clean or "Bilinmeyen",
+                "hwid": hwid_clean or "N/A",
+                "virtual_ip": allocated_ip,
+                "first_seen": now_iso,
+                "last_seen": now_iso,
+                "last_seen_ts": time.time(),
+                "is_online": False,
+                "login_count": 0,
+            }
+
+        self._save_history()
+        return allocated_ip
+
     def record_login(self, client_info: dict, peer_addr: tuple):
         """Records an authenticated client session."""
         username = str(client_info.get("username") or "Bilinmeyen").strip()
@@ -65,19 +130,36 @@ class ClientHistoryManager:
         now_iso = datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
 
         # Determine unique key: prefer full HWID, fallback to username
-        key = hwid if (hwid and len(hwid) > 10) else f"USER_{username.lower()}"
+        has_valid_hwid = bool(hwid and len(hwid) > 10)
+        key = hwid if has_valid_hwid else f"USER_{username.lower()}"
 
         existing = self._history.get(key)
         if not existing:
-            # Check by username as well
-            for k, v in list(self._history.items()):
-                if v.get("username", "").lower() == username.lower():
-                    existing = v
-                    key = k
-                    break
+            # If client has no valid HWID, match only unverified records
+            if not has_valid_hwid:
+                for k, v in list(self._history.items()):
+                    rec_hwid = str(v.get("hwid") or "").strip()
+                    if (not rec_hwid or rec_hwid == "N/A" or k.startswith("USER_")) and v.get("username", "").lower() == username.lower():
+                        existing = v
+                        key = k
+                        break
+            else:
+                # If client has valid HWID, check if there is an unkeyed legacy placeholder
+                legacy_key = f"USER_{username.lower()}"
+                legacy_entry = self._history.get(legacy_key)
+                if legacy_entry:
+                    rec_hwid = str(legacy_entry.get("hwid") or "").strip()
+                    if not rec_hwid or rec_hwid == "N/A":
+                        existing = legacy_entry
+                        self._history.pop(legacy_key, None)
 
         first_seen = existing.get("first_seen", now_iso) if existing else now_iso
         login_count = (existing.get("login_count", 0) + 1) if existing else 1
+
+        virtual_ip = client_info.get("virtual_ip") or (existing.get("virtual_ip") if existing else None)
+        if not virtual_ip:
+            virtual_ip = self.get_or_assign_virtual_ip(hwid, username)
+        client_info["virtual_ip"] = virtual_ip
 
         record = {
             "key": key,
@@ -87,6 +169,7 @@ class ClientHistoryManager:
             "hwid_details": hwid_details or (existing.get("hwid_details") if existing else {}),
             "os": client_info.get("os") or (existing.get("os") if existing else "Bilinmiyor"),
             "version": client_info.get("version") or (existing.get("version") if existing else "-"),
+            "virtual_ip": virtual_ip,
             "ip": ip or (existing.get("ip") if existing else "-"),
             "port": port or (existing.get("port") if existing else 0),
             "peer_addr": f"{ip}:{port}" if ip else "-",
@@ -112,7 +195,7 @@ class ClientHistoryManager:
                 match = True
             elif hwid and record.get("hwid", "").upper() == hwid.upper():
                 match = True
-            elif username and record.get("username", "").lower() == username.lower():
+            elif username and (not record.get("hwid") or record.get("hwid") == "N/A" or key.startswith("USER_")) and record.get("username", "").lower() == username.lower():
                 match = True
 
             if match:

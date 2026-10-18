@@ -1,5 +1,5 @@
 """
-P2P_MC Client Launcher.
+P2P Tunnel Client Launcher.
 Launches the modern PyQt6 animated GUI by default, or headless CLI if requested.
 """
 
@@ -16,7 +16,8 @@ def main():
     parser.add_argument("-a", "--admin", dest="admin_key", default="", help="Yönetici Anahtarı")
     parser.add_argument("--config", default=None, help="Özel ayar JSON dosya yolu")
     parser.add_argument("--cli", action="store_true", help="Grafik arayüz (GUI) yerine konsol / headless modunda çalıştır")
-    args = parser.parse_args()
+    parser.add_argument("--updated", action="store_true", help="Güncelleme sonrası başlatma bayrağı")
+    args, _ = parser.parse_known_args()
 
     # Detect if GUI is available
     use_cli = args.cli or bool(args.server_code)

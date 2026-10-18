@@ -118,6 +118,22 @@ def get_motherboard_details() -> Dict[str, str]:
         except Exception:
             pass
 
+        # 3. Registry fallback for system hardware UUID if PowerShell was blocked/empty
+        if not details["uuid"]:
+            try:
+                import winreg
+                with winreg.OpenKey(
+                    winreg.HKEY_LOCAL_MACHINE,
+                    r"SYSTEM\CurrentControlSet\Control\SystemInformation",
+                    0,
+                    winreg.KEY_READ | winreg.KEY_WOW64_64KEY
+                ) as key:
+                    hw_id = str(winreg.QueryValueEx(key, "ComputerHardwareId")[0]).strip()
+                    if hw_id:
+                        details["uuid"] = hw_id.strip("{}")
+            except Exception:
+                pass
+
     elif sys.platform.startswith("linux"):
         # Linux hardware identification
         for p in ("/sys/class/dmi/id/product_uuid", "/etc/machine-id", "/var/lib/dbus/machine-id"):
@@ -155,11 +171,76 @@ def get_mac_address() -> str:
         return ""
 
 
+def get_persistent_device_id() -> str:
+    """Retrieves or creates a persistent cryptographic device ID stored in app data dir."""
+    try:
+        from core.paths import get_app_data_dir
+        app_dir = get_app_data_dir()
+        dev_file = os.path.join(app_dir, ".device_id")
+        if os.path.exists(dev_file):
+            try:
+                with open(dev_file, "r", encoding="utf-8") as f:
+                    content = f.read().strip()
+                    if len(content) >= 32:
+                        return content
+            except Exception:
+                pass
+        new_id = uuid.uuid4().hex
+        try:
+            with open(dev_file, "w", encoding="utf-8") as f:
+                f.write(new_id)
+        except Exception:
+            pass
+        return new_id
+    except Exception:
+        return ""
+
+
 def get_cpu_identifier() -> str:
-    """Gets CPU identifier string."""
+    """
+    Gets CPU identifier string.
+    Prioritizes Registry and platform information over environment variables to prevent tampering.
+    """
     if sys.platform == "win32":
-        return os.environ.get("PROCESSOR_IDENTIFIER", "").strip() or platform.processor()
-    return platform.processor() or ""
+        # 1. Primary: Windows Registry CentralProcessor
+        try:
+            import winreg
+            with winreg.OpenKey(
+                winreg.HKEY_LOCAL_MACHINE,
+                r"HARDWARE\DESCRIPTION\System\CentralProcessor\0",
+                0,
+                winreg.KEY_READ | winreg.KEY_WOW64_64KEY
+            ) as key:
+                def _val(name):
+                    try:
+                        return str(winreg.QueryValueEx(key, name)[0]).strip()
+                    except Exception:
+                        return ""
+                ident = _val("Identifier")
+                vendor = _val("VendorIdentifier")
+                name_str = _val("ProcessorNameString")
+                if ident and vendor:
+                    return f"{ident}, {vendor}"
+                elif ident:
+                    return ident
+                elif name_str:
+                    return name_str
+        except Exception:
+            pass
+
+    # 2. Platform processor / machine
+    proc = platform.processor().strip()
+    if proc:
+        return proc
+    mach = platform.machine().strip()
+    if mach:
+        return mach
+
+    # 3. Environment variable (last resort fallback only)
+    if sys.platform == "win32":
+        return os.environ.get("PROCESSOR_IDENTIFIER", "").strip()
+
+    return ""
 
 
 def get_client_identity() -> Dict[str, Any]:
@@ -187,6 +268,7 @@ def get_client_identity() -> Dict[str, Any]:
     vol_serial = get_windows_volume_serial()
     cpu_id = get_cpu_identifier()
     mac = get_mac_address()
+    device_id = get_persistent_device_id()
 
     # User identification (display name)
     try:
@@ -228,6 +310,7 @@ def get_client_identity() -> Dict[str, Any]:
             "volume_serial": vol_serial,
             "cpu_id": cpu_id,
             "mac": mac,
+            "device_id": device_id,
         },
         "os": f"{platform.system()} {platform.release()}",
         "platform": sys.platform,

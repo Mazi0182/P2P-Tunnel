@@ -1,5 +1,5 @@
 """
-P2P_MC Server Access Control & Port Isolation Firewall.
+P2P Tunnel Server Access Control & Port Isolation Firewall.
 Enforces strict role boundaries and hardware ban policies:
 - HWID Ban Enforcement via BanManager.
 - PLAYER: Strictly limited to port 25565 only. All other ports blocked and dropped.
@@ -7,6 +7,8 @@ Enforces strict role boundaries and hardware ban policies:
 - Graceful Fallback: Invalid admin keys automatically degrade to PLAYER role instead of dropping connection.
 """
 
+from collections import deque
+import hashlib
 import hmac
 from typing import Optional, Set, Any
 from core.protocol import Role
@@ -14,7 +16,7 @@ from server.ban_manager import BanManager
 
 
 class ServerACL:
-    """Access Control List and Port Firewall for P2P_MC."""
+    """Access Control List and Port Firewall for P2P Tunnel."""
 
     def __init__(
         self,
@@ -31,6 +33,8 @@ class ServerACL:
         self.connection_address = (connection_address or "baglanti.localhost").strip()
         self.ban_manager = ban_manager or BanManager()
         self.version_manager = version_manager
+        self._used_nonces: deque = deque(maxlen=1000)
+        self._used_nonces_set: Set[str] = set()
 
     def add_player_token(self, token: str):
         if token:
@@ -38,39 +42,110 @@ class ServerACL:
 
     def authenticate(
         self,
-        token: str,
-        hwid: Optional[str] = None,
+        token: str = "",
+        client_version: str = "",
+        hwid: str = "",
         hwid_details: Optional[dict] = None,
-        client_version: Optional[str] = None
+        client_nonce: str = "",
+        token_hmac: str = "",
+        room_secret: str = "",
+        **kwargs
     ) -> Role:
         """
         Verifies authentication, checks bans, validates client version, and assigns Role.
-        - If client HWID or hardware components match ban list -> raises PermissionError('BANNED:...')
-        - If client is not on the latest version -> raises PermissionError('OUTDATED:...')
-        - If token matches admin_secret -> returns Role.ADMIN
-        - If token is invalid or does not match admin_secret -> falls back to Role.PLAYER (graceful fallback)
+        - Supports cryptographic HMAC challenge-response to prevent token exposure even to rogue servers.
+        - Replay attack mitigation via rolling nonce cache.
+        - HWID ban enforcement via BanManager.
+        - Strict version enforcement via VersionManager.
         """
-        # 1. Enforce HWID & Multi-Hardware Ban Check
-        banned, ban_rec = self.ban_manager.is_banned(hwid=hwid, hwid_details=hwid_details)
-        if banned:
-            reason = ban_rec.get("reason", "Cihazınız sunucu yöneticisi tarafından yasaklanmıştır.")
-            raise PermissionError(f"BANNED:{reason}")
+        # Positional parameter swap protection (supports old (token, hwid, hwid_details, ver) signature)
+        if isinstance(client_version, str) and client_version.startswith("HWID-") and not hwid:
+            hwid_val = client_version
+            hwid_det_val = hwid_details if isinstance(hwid_details, dict) else (hwid if isinstance(hwid, dict) else {})
+            actual_ver = kwargs.get("client_version") or ""
+            hwid = hwid_val
+            hwid_details = hwid_det_val
+            client_version = actual_ver
 
-        # 2. Strict Latest Client Version Check
+        # 1. Replay Protection: Nonce must be unique per connection
+        if client_nonce:
+            client_nonce_str = str(client_nonce).strip()
+            if client_nonce_str in self._used_nonces_set:
+                raise PermissionError("REPLAY_DETECTED: Tekrar eden bağlantı isteği engellendi.")
+            if len(self._used_nonces) >= 1000:
+                old_nonce = self._used_nonces.popleft()
+                self._used_nonces_set.discard(old_nonce)
+            self._used_nonces.append(client_nonce_str)
+            self._used_nonces_set.add(client_nonce_str)
+
+        # 2. Enforce HWID & Multi-Hardware Ban Check (if provided)
+        if hwid or hwid_details:
+            banned, ban_rec = self.ban_manager.is_banned(hwid=hwid, hwid_details=hwid_details)
+            if banned:
+                reason = (ban_rec or {}).get("reason", "Cihazınız sunucu yöneticisi tarafından yasaklanmıştır.")
+                raise PermissionError(f"BANNED:{reason}")
+
+            hwid_str = str(hwid or "").strip()
+            if hwid_str and (len(hwid_str) < 12 or not (hwid_str.startswith("HWID-") or "HWID" in hwid_str)):
+                raise PermissionError("INVALID_HWID: Geçersiz donanım kimliği (HWID) formatı.")
+
+        # 3. Cryptographic HMAC Token Verification (Protects Admin & Player Secrets from Rogue Servers)
+        if token_hmac and client_nonce:
+            # Check Admin HMAC
+            if self.admin_secret:
+                expected_admin_hmac = hmac.new(
+                    self.admin_secret.encode("utf-8"),
+                    f"P2P_AUTH:{room_secret}:{client_nonce}".encode("utf-8"),
+                    hashlib.sha256
+                ).hexdigest()
+                if hmac.compare_digest(token_hmac, expected_admin_hmac):
+                    if self.version_manager:
+                        ok, req_ver, err_reason = self.version_manager.check_client_version(client_version)
+                        if not ok:
+                            raise PermissionError(f"OUTDATED:{req_ver}:{err_reason}")
+                    return Role.ADMIN
+
+            # Check Player HMAC
+            active_player_tokens = {t for t in self.player_tokens if t}
+            for pt in active_player_tokens:
+                expected_pt_hmac = hmac.new(
+                    pt.encode("utf-8"),
+                    f"P2P_AUTH:{room_secret}:{client_nonce}".encode("utf-8"),
+                    hashlib.sha256
+                ).hexdigest()
+                if hmac.compare_digest(token_hmac, expected_pt_hmac):
+                    if self.version_manager:
+                        ok, req_ver, err_reason = self.version_manager.check_client_version(client_version)
+                        if not ok:
+                            raise PermissionError(f"OUTDATED:{req_ver}:{err_reason}")
+                    return Role.PLAYER
+
+        # 4. Fallback: Legacy Plaintext Token & Role verification
+        token = str(token or "").strip()
+
+        # Admin Secret Verification (Legacy Plaintext)
+        if self.admin_secret and token and token != "HMAC_PROTECTED" and hmac.compare_digest(token, self.admin_secret):
+            if self.version_manager:
+                ok, req_ver, err_reason = self.version_manager.check_client_version(client_version)
+                if not ok:
+                    raise PermissionError(f"OUTDATED:{req_ver}:{err_reason}")
+            return Role.ADMIN
+
+        # Player Token Verification (Legacy Plaintext) / Graceful Fallback to Role.PLAYER
+        active_player_tokens = {t for t in self.player_tokens if t}
+        if active_player_tokens and token and token != "HMAC_PROTECTED":
+            for pt in active_player_tokens:
+                try:
+                    if hmac.compare_digest(token, pt):
+                        break
+                except Exception:
+                    pass
+
         if self.version_manager:
             ok, req_ver, err_reason = self.version_manager.check_client_version(client_version)
             if not ok:
                 raise PermissionError(f"OUTDATED:{req_ver}:{err_reason}")
 
-        token = token or ""
-
-        # 3. Strict Constant-Time Admin Key Verification
-        if self.admin_secret and hmac.compare_digest(token, self.admin_secret):
-            return Role.ADMIN
-
-        # 3. Graceful Fallback:
-        # If admin key is missing or incorrect, client is NOT disconnected.
-        # Fallback to standard PLAYER role (strictly quarantined to game port 25565).
         return Role.PLAYER
 
     def is_port_allowed(self, role: Role, target_port: int) -> bool:

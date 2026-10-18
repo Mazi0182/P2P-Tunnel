@@ -1,5 +1,5 @@
 r"""
-P2P_MC System Path Management.
+P2P Tunnel System Path Management.
 Ensures persistent configuration storage strictly in C:\ProgramData\P2PTunnel.
 """
 

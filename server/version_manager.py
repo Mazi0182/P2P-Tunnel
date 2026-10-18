@@ -73,8 +73,30 @@ class VersionManager:
         self._lock = threading.Lock()
         self.last_error: Optional[str] = None
 
-        # Fetch immediately in background on init
-        self.refresh_sync()
+        self._refreshing: bool = False
+
+        # Fetch in background on init without blocking caller thread
+        self._trigger_background_refresh()
+
+    def _trigger_background_refresh(self):
+        """Triggers non-blocking background refresh in an asyncio task or daemon thread."""
+        with self._lock:
+            if self._refreshing:
+                return
+            self._refreshing = True
+
+        def _worker():
+            try:
+                self.refresh_sync()
+            finally:
+                with self._lock:
+                    self._refreshing = False
+
+        try:
+            loop = asyncio.get_running_loop()
+            loop.create_task(asyncio.to_thread(_worker))
+        except RuntimeError:
+            threading.Thread(target=_worker, daemon=True).start()
 
     def set_manual_min_version(self, ver: Optional[str]):
         """Manually override or lock required version (e.g., via web panel). Set None for auto."""
@@ -118,7 +140,7 @@ class VersionManager:
         return None
 
     def get_required_version(self, force_refresh: bool = False) -> str:
-        """Returns the latest required version string."""
+        """Returns the latest required version string without blocking the event loop."""
         with self._lock:
             if self.manual_min_version:
                 return self.manual_min_version
@@ -127,14 +149,14 @@ class VersionManager:
             needs_refresh = force_refresh or (now - self.last_fetch_time > self.cache_ttl)
 
         if needs_refresh:
-            self.refresh_sync()
+            self._trigger_background_refresh()
 
         with self._lock:
             return self.cached_latest_version
 
     def check_client_version(self, client_version: Optional[str]) -> Tuple[bool, str, str]:
         """
-        Validates client version against the latest required version.
+        Validates client version against the latest required version without blocking.
         Returns:
             (is_allowed: bool, required_version: str, error_message: str)
         """
@@ -150,11 +172,11 @@ class VersionManager:
 
         client_ver = str(client_version).strip()
 
-        # If client reports a newer version than cached, immediately check R2 to keep server in sync!
+        # If client reports a newer version than cached, trigger non-blocking background refresh to keep server in sync!
         if compare_versions(client_ver, required_ver) > 0 and not self.manual_min_version:
-            refreshed = self.refresh_sync()
-            if refreshed:
-                required_ver = refreshed
+            self._trigger_background_refresh()
+            # Temporarily permit the newer client while background refresh completes
+            return (True, required_ver, "")
 
         # Strict check: client must be >= required_version
         cmp_res = compare_versions(client_ver, required_ver)

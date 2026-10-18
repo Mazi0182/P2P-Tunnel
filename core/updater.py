@@ -18,7 +18,7 @@ from typing import Optional, Callable, Dict, Any
 logger = logging.getLogger("P2P_Updater")
 
 # Current application semantic version
-APP_VERSION = "3.2"
+APP_VERSION = "4.0"
 
 # Public R2 Update Endpoint
 DEFAULT_UPDATE_URL = "https://updates.mazidev.xyz/version.json"
@@ -138,6 +138,29 @@ def download_file(
                             pass
                     return False
 
+            # Validate that downloaded file is a valid Windows executable (size > 100KB, magic b"MZ")
+            if dest_path.lower().endswith(".exe") or sys.platform == "win32":
+                file_size = os.path.getsize(temp_dest) if os.path.exists(temp_dest) else 0
+                if file_size < 100 * 1024:
+                    logger.error(f"Download validation failed: file size too small ({file_size} bytes)")
+                    if os.path.exists(temp_dest):
+                        try:
+                            os.remove(temp_dest)
+                        except Exception:
+                            pass
+                    return False
+
+                with open(temp_dest, "rb") as check_f:
+                    magic_bytes = check_f.read(2)
+                if magic_bytes != b"MZ":
+                    logger.error(f"Download validation failed: invalid PE magic header ({magic_bytes!r}, expected b'MZ')")
+                    if os.path.exists(temp_dest):
+                        try:
+                            os.remove(temp_dest)
+                        except Exception:
+                            pass
+                    return False
+
             if os.path.exists(dest_path):
                 try:
                     os.remove(dest_path)
@@ -150,15 +173,33 @@ def download_file(
         return False
 
 
-def apply_update_and_restart(new_binary_path: str, target_filename: Optional[str] = None):
+def _apply_windows_update(new_binary_path: str, target_filename: Optional[str] = None):
     """
     On Windows:
     Safely and silently updates the running executable in its original folder.
     Cleans PyInstaller _MEIPASS environment variables to prevent Python DLL load failures.
+    Includes automated rollback protection if moving the new binary fails.
     Uses a hidden VBS runner so zero CMD windows pop up.
     """
     if sys.platform != "win32":
         logger.warning("Auto-restart replacement currently designed for Windows.")
+        return
+
+    if not os.path.exists(new_binary_path):
+        logger.error(f"Update binary not found: {new_binary_path}")
+        return
+
+    if os.path.getsize(new_binary_path) < 100 * 1024:
+        logger.error("Update binary is corrupted (size < 100KB).")
+        return
+
+    try:
+        with open(new_binary_path, "rb") as f:
+            if f.read(2) != b"MZ":
+                logger.error("Update binary is corrupted (missing MZ header).")
+                return
+    except Exception as e:
+        logger.error(f"Failed to verify binary header: {e}")
         return
 
     current_exe = os.path.abspath(sys.executable)
@@ -198,28 +239,39 @@ taskkill /F /PID {current_pid} >nul 2>&1
 :: 2. Wait 1 second silently for OS file release
 ping 127.0.0.1 -n 2 >nul
 
-:: 3. Delete old executable if target name differs
+:: 3. Backup old executable if target name differs
 if /i not "%OLDEXE%"=="%TARGET%" (
-    del /f /q "%OLDEXE%" >nul 2>&1
     if exist "%OLDEXE%" (
         move /y "%OLDEXE%" "%OLDEXE%.old" >nul 2>&1
     )
 )
 
-:: 4. Remove destination target if exists
+:: 4. Backup existing target executable before replacing
 if exist "%TARGET%" (
-    del /f /q "%TARGET%" >nul 2>&1
-    if exist "%TARGET%" (
-        move /y "%TARGET%" "%TARGET%.old" >nul 2>&1
-    )
+    move /y "%TARGET%" "%TARGET%.old" >nul 2>&1
 )
 
 :: 5. Place new binary into the exact directory
 move /y "%NEWFILE%" "%TARGET%" >nul 2>&1
+if errorlevel 1 goto ROLLBACK
+if not exist "%TARGET%" goto ROLLBACK
 
-:: 6. Clean up temporary files
+:: 6. Success: Clean up temporary backup files
 del /f /q "%OLDEXE%.old" >nul 2>&1
 del /f /q "%TARGET%.old" >nul 2>&1
+goto FINISH
+
+:ROLLBACK
+:: Rollback: restore previous executable on failure, keeping .old intact
+if not exist "%TARGET%" (
+    if exist "%TARGET%.old" (
+        move /y "%TARGET%.old" "%TARGET%" >nul 2>&1
+    ) else if exist "%OLDEXE%.old" (
+        move /y "%OLDEXE%.old" "%TARGET%" >nul 2>&1
+    )
+)
+
+:FINISH
 (goto) 2>nul & del "%~f0"
 """
 
@@ -246,3 +298,8 @@ del /f /q "%TARGET%.old" >nul 2>&1
 
     # Immediately terminate current process at OS level
     os._exit(0)
+
+
+def apply_update_and_restart(new_binary_path: str, target_filename: Optional[str] = None):
+    """Public wrapper to apply update and restart executable."""
+    return _apply_windows_update(new_binary_path, target_filename)

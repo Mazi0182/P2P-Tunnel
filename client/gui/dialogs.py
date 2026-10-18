@@ -104,7 +104,7 @@ class ServerConfigPage(QWidget):
         form_layout.addWidget(lbl_code)
 
         self.input_code = AnimatedLineEdit(form_card)
-        self.input_code.setPlaceholderText("Örn: A1B2-C3D4")
+        self.input_code.setPlaceholderText("Örn: A1B2-C3D4-E5F6")
         self.input_code.setFixedHeight(36)
         self.input_code.returnPressed.connect(self._on_save_clicked)
         form_layout.addWidget(self.input_code)

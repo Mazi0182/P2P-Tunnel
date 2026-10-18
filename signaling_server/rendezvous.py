@@ -1,5 +1,5 @@
-﻿"""
-P2P_MC Standalone Ultra-Lightweight HTTP Rendezvous Signaling Server.
+"""
+P2P Tunnel Standalone Ultra-Lightweight HTTP Rendezvous Signaling Server.
 Runs on any VPS, cloud instance, or locally with zero external dependencies.
 """
 

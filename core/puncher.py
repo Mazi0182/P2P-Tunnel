@@ -1,5 +1,5 @@
-﻿"""
-P2P_MC UDP Hole Puncher & NAT Traversal Engine.
+"""
+P2P Tunnel UDP Hole Puncher & NAT Traversal Engine.
 Punches bidirectional UDP pinholes through CGNAT firewalls and locks peer endpoints.
 """
 
@@ -9,8 +9,8 @@ from typing import Tuple, Optional, Callable
 from core.crypto import PacketCipher
 
 # Punching Control Opcode
-PUNCH_SYN = b"P2P_MC_PUNCH_SYN"
-PUNCH_ACK = b"P2P_MC_PUNCH_ACK"
+PUNCH_SYN = b"P2P_TUN_PUNCH_SYN"
+PUNCH_ACK = b"P2P_TUN_PUNCH_ACK"
 
 
 class UDPPuncher:

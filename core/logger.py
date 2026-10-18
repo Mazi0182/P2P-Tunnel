@@ -1,5 +1,5 @@
 r"""
-P2P_MC High-Precision Disk & Console Logger.
+P2P Tunnel High-Precision Disk & Console Logger.
 Stores persistent, chronological forensic logs in C:\ProgramData\P2PTunnel\*.log.
 """
 

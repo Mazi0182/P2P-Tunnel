@@ -1,5 +1,5 @@
 """
-P2P_MC Rendezvous & Signaling Module.
+P2P Tunnel Rendezvous & Signaling Module.
 Handles peer endpoint exchange (Public IP & Port + Local LAN Port) across CGNAT and Firewalls.
 Features:
 - Zero-Configuration HTTPS Signaling via ntfy.sh (port 443, never blocked by mobile/CGNAT firewalls)
@@ -34,14 +34,14 @@ def get_room_id_from_code(code_or_addr: str) -> str:
             ip = parts[0]
             port = int(parts[1])
             sc = ip_port_to_short_code(ip, port)
-            return f"p2pmc_{sc.replace('-', '').lower()}"
+            return f"p2ptun_{sc.replace('-', '').lower()}"
         except Exception:
             pass
 
     short_pair = short_code_to_ip_port(clean)
     if short_pair:
         clean_hex = clean.replace("-", "").lower()
-        return f"p2pmc_{clean_hex}"
+        return f"p2ptun_{clean_hex}"
 
     room_id, _, _ = derive_credentials_from_key(clean)
     return room_id

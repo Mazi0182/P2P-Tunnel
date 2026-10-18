@@ -1,5 +1,5 @@
 """
-P2P_MC Multiplexing Protocol & Packet Definitions.
+P2P Tunnel Multiplexing Protocol & Packet Definitions.
 Frame Structure (Inside Encrypted Payload):
   [ 4B Stream ID ] + [ 1B Cmd ] + [ 2B Port ] + [ 2B Payload Length ] + [ Payload Data ]
 """
@@ -23,6 +23,8 @@ class Cmd(IntEnum):
 class Role(IntEnum):
     PLAYER = 0x01  # Strictly limited to port 25565 only
     ADMIN  = 0x02  # Full port access (SSH 22, etc.)
+
+DEFAULT_TOKEN = "tok_p2p_player_fallback"
 
 HEADER_STRUCT = struct.Struct("!IBHH")  # stream_id (4B), cmd (1B), target_port (2B), length (2B)
 HEADER_LEN = HEADER_STRUCT.size  # 9 bytes

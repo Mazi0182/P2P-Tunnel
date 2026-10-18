@@ -69,21 +69,30 @@ class BanManager:
         - Motherboard UUID
         - Windows MachineGuid
         - Volume Serial
+        - Persistent Device ID
         """
         hwid = (hwid or "").strip()
-        details = hwid_details or {}
+        details = hwid_details if isinstance(hwid_details, dict) else {}
+
         mb_uuid = str(details.get("motherboard_uuid") or "").strip()
         m_guid = str(details.get("machine_guid") or "").strip()
         vol_serial = str(details.get("volume_serial") or "").strip()
+        dev_id = str(details.get("device_id") or "").strip()
+
+        # If both HWID is invalid/empty (<12 chars) and all details are empty,
+        # return False safely. (Strict rejection happens at acl.py)
+        if (not hwid or len(hwid) < 12) and not (mb_uuid or m_guid or vol_serial or dev_id):
+            return False, None
 
         for ban_id, record in self._bans.items():
             b_hwid = str(record.get("hwid") or "").strip()
             b_mb_uuid = str(record.get("motherboard_uuid") or "").strip()
             b_m_guid = str(record.get("machine_guid") or "").strip()
             b_vol_serial = str(record.get("volume_serial") or "").strip()
+            b_dev_id = str(record.get("device_id") or "").strip()
 
-            # 1. Exact or prefix composite HWID match
-            if hwid and b_hwid:
+            # 1. Exact or prefix composite HWID match (strictly requiring >= 12 chars)
+            if hwid and len(hwid) >= 12 and b_hwid and len(b_hwid) >= 12:
                 clean_b_hwid = b_hwid.rstrip(".")
                 if hwid.upper() == b_hwid.upper():
                     return True, record
@@ -93,7 +102,9 @@ class BanManager:
                         return True, record
 
             # 2. Motherboard UUID match (ignores generic "Default string" or empty)
-            if mb_uuid and b_mb_uuid and len(mb_uuid) > 8 and mb_uuid.lower() not in ("default string", "none", "unknown"):
+            if mb_uuid and b_mb_uuid and len(mb_uuid) > 8 and mb_uuid.lower() not in (
+                "default string", "none", "unknown", "to be filled by o.e.m."
+            ):
                 if mb_uuid.upper() == b_mb_uuid.upper():
                     return True, record
 
@@ -107,6 +118,11 @@ class BanManager:
                 if vol_serial.upper() == b_vol_serial.upper():
                     return True, record
 
+            # 5. Persistent Device ID match
+            if dev_id and b_dev_id and len(dev_id) >= 16:
+                if dev_id.upper() == b_dev_id.upper():
+                    return True, record
+
         return False, None
 
     def ban(
@@ -118,7 +134,7 @@ class BanManager:
         banned_by: str = "Yönetici"
     ) -> dict:
         """Creates or updates a ban record."""
-        details = hwid_details or {}
+        details = hwid_details if isinstance(hwid_details, dict) else {}
         ban_id = f"ban_{uuid.uuid4().hex[:8]}"
         now_iso = datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
 
@@ -130,6 +146,7 @@ class BanManager:
             "machine_guid": str(details.get("machine_guid") or "").strip().upper(),
             "volume_serial": str(details.get("volume_serial") or "").strip().upper(),
             "mac": str(details.get("mac") or "").strip().upper(),
+            "device_id": str(details.get("device_id") or "").strip().upper(),
             "username": username or "Bilinmeyen",
             "reason": reason.strip() or "Yönetici tarafından yasaklandı",
             "banned_at": now_iso,

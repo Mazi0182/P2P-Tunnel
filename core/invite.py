@@ -14,32 +14,35 @@ DEFAULT_ROOM_SECRET = "sec_p2p_default_fallback"
 DEFAULT_PLAYER_TOKEN = "tok_p2p_player_fallback"
 
 
-def generate_server_key() -> str:
+def generate_server_key(length: int = 12) -> str:
     """
-    Generates a unique, persistent 8-character server key.
-    Format: XXXX-YYYY
+    Generates a unique, high-entropy persistent server key.
+    Standard: 12 hex characters (48-bit entropy) -> XXXX-XXXX-XXXX.
     """
-    h = secrets.token_hex(4).upper()
-    return f"{h[:4]}-{h[4:8]}"
+    h = secrets.token_hex(6).upper()
+    return f"{h[:4]}-{h[4:8]}-{h[8:12]}"
 
 
 def normalize_server_key(key: str) -> str:
-    """Normalizes server key by stripping legacy 'MC-' prefix if present."""
-    val = (key or "").strip().upper()
-    if val.startswith("MC-"):
-        val = val[3:]
-    return val
+    """
+    Normalizes server key by removing dashes/spaces and formatting into standard XXXX-XXXX-XXXX (12 hex characters).
+    """
+    clean = (key or "").strip().replace("-", "").replace(" ", "").upper()
+    if len(clean) == 12:
+        return f"{clean[:4]}-{clean[4:8]}-{clean[8:12]}"
+    return clean
 
 
 def derive_credentials_from_key(key: str) -> tuple:
     """
     Derives deterministic (room_id, room_secret, player_token) strictly from persistent server key.
+    Strictly accepts standard 12 hex character keys (XXXX-XXXX-XXXX).
     """
     clean = key.strip().replace("-", "").replace(" ", "").upper()
-    if clean.startswith("MC") and len(clean) == 10:
-        clean = clean[2:]
-    h = hashlib.sha256(f"P2P_MC_KEY_MC{clean}".encode("utf-8")).hexdigest()
-    room_id = f"p2pmc_{h[:16]}"
+    if len(clean) != 12:
+        raise ValueError("Geçersiz bağlantı kodu! Standart XXXX-XXXX-XXXX (12 karakter) formatında olmalıdır.")
+    h = hashlib.sha256(f"P2P_TUNNEL_KEY_{clean}".encode("utf-8")).hexdigest()
+    room_id = f"p2ptun_{h[:16]}"
     room_secret = f"SEC_{h[16:40]}"
     player_token = f"TOK_{h[40:56]}"
     return room_id, room_secret, player_token
@@ -47,10 +50,10 @@ def derive_credentials_from_key(key: str) -> tuple:
 
 def derive_room_credentials(ip: str, port: int) -> tuple:
     """Legacy fallback for direct IP:port."""
-    raw = f"P2P_MC_KEY_{ip}_{port}"
+    raw = f"P2P_TUNNEL_KEY_{ip}_{port}"
     h = hashlib.sha256(raw.encode("utf-8")).hexdigest()
     code_hex = ip_port_to_short_code(ip, port).replace("-", "").lower()
-    room_id = f"p2pmc_{code_hex}"
+    room_id = f"p2ptun_{code_hex}"
     room_secret = f"SEC_{h[:24]}"
     player_token = f"TOK_{h[24:40]}"
     return room_id, room_secret, player_token
@@ -98,7 +101,10 @@ def parse_invite_code(input_str: str) -> Optional[Dict]:
         key_part, addr_part = input_str.split("@", 1)
         key_part = normalize_server_key(key_part)
         addr_part = addr_part.strip()
-        room_id, room_sec, play_tok = derive_credentials_from_key(key_part)
+        try:
+            room_id, room_sec, play_tok = derive_credentials_from_key(key_part)
+        except ValueError:
+            return None
         target_ip = addr_part
         target_port = 25566
         if ":" in addr_part:
@@ -120,17 +126,20 @@ def parse_invite_code(input_str: str) -> Optional[Dict]:
         }
 
     if not clean.startswith("P2P-") and not clean.startswith("P2P_") and ":" not in clean:
-        room_id, room_sec, play_tok = derive_credentials_from_key(clean)
-        return {
-            "name": f"Sunucu ({clean})",
-            "key": clean,
-            "ip": None,
-            "port": None,
-            "local_port": None,
-            "sec": room_sec,
-            "tok": play_tok,
-            "room": room_id,
-        }
+        try:
+            room_id, room_sec, play_tok = derive_credentials_from_key(clean)
+            return {
+                "name": f"Sunucu ({clean})",
+                "key": clean,
+                "ip": None,
+                "port": None,
+                "local_port": None,
+                "sec": room_sec,
+                "tok": play_tok,
+                "room": room_id,
+            }
+        except ValueError:
+            pass
 
     if ":" in input_str and not input_str.startswith("P2P-") and not input_str.startswith("p2p-"):
         parts = input_str.split(":")

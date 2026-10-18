@@ -1,5 +1,5 @@
 """
-P2P_MC Server Launcher.
+P2P Tunnel Server Launcher.
 Runs headless server daemon on Ubuntu Server, OpenWrt (Pi 4), or Windows.
 """
 
@@ -14,7 +14,7 @@ from server.server_daemon import P2PMCServer
 def acquire_single_instance_mutex():
     if sys.platform == "win32":
         import ctypes
-        mutex = ctypes.windll.kernel32.CreateMutexW(None, False, "Global\\P2P_MC_SERVER_INSTANCE_MUTEX")
+        mutex = ctypes.windll.kernel32.CreateMutexW(None, False, "Global\\P2P_TUNNEL_SERVER_INSTANCE_MUTEX")
         if ctypes.windll.kernel32.GetLastError() == 183:  # ERROR_ALREADY_EXISTS
             print("\n" + "=" * 64)
             print("  [!] HATA: P2P Sunucu zaten başka bir pencerede veya")
@@ -42,7 +42,7 @@ def acquire_single_instance_mutex():
             return None
 
 def main():
-    parser = argparse.ArgumentParser(description="P2P_MC Headless Server Daemon")
+    parser = argparse.ArgumentParser(description="P2P Tunnel Headless Server Daemon")
     parser.add_argument("--config", default=None, help="Sunucu ayar JSON dosyası")
     parser.add_argument("--admin-key", default=None, help="Özel Yönetici Anahtarı")
     mode_group = parser.add_mutually_exclusive_group()

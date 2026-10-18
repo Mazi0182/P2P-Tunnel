@@ -1,17 +1,20 @@
 """
-P2P_MC High-Performance Asynchronous Tunnel Engine.
+P2P Tunnel High-Performance Asynchronous Tunnel Engine.
 Cross-platform asyncio.DatagramProtocol integration for Windows (IOCP) and Linux (Epoll).
 Bridges local TCP sockets (Minecraft 25565 / SSH 22) across KCP and encrypted P2P UDP.
 """
 
 import asyncio
+import hashlib
+import hmac
 import json
+import secrets
 import socket
 import struct
 import time
 from typing import Dict, Tuple, Optional, Callable, Any
 
-from core.crypto import PacketCipher
+from core.crypto import PacketCipher, derive_session_key
 from core.kcp import KCPPeer
 from core.logger import client_logger, server_logger
 from core.protocol import Cmd, Role, encode_frame, decode_frame
@@ -288,23 +291,32 @@ class P2PTunnel:
         shared_socket: bool = False,
         client_identity: Optional[dict] = None,
         mtu: Optional[int] = None,
+        room_secret: str = "",
+        target_host: str = "127.0.0.1",
     ):
         self.udp_sock = udp_sock
         self.peer_addr = peer_addr
         self.cipher = cipher
+        self.conv_id = conv_id
         self.is_server = is_server
         self.acl = acl
         self.auth_token = auth_token
         self.shared_socket = shared_socket
         self.client_identity = client_identity
+        self.room_secret = room_secret
+        self.target_host = target_host or "127.0.0.1"
+        self.virtual_ip: Optional[str] = None
         self.client_info: Dict[str, Any] = {}
         self.auth_fail_reason = ""
         self.logger = server_logger if is_server else client_logger
         self.running = bool(shared_socket)
         self.authenticated = False
         self.peer_role: Optional[Role] = None
+        self.raw_rtt_ms = 0.0
+        self.app_rtt_ms = 0.0
         self.current_rtt_ms = 0.0
         self.last_inbound_time = time.time()
+        self._inbound_event = asyncio.Event()
 
         # TCP streams: stream_id -> (reader, writer)
         self.streams: Dict[int, Tuple[asyncio.StreamReader, asyncio.StreamWriter]] = {}
@@ -431,31 +443,32 @@ class P2PTunnel:
         self.last_inbound_time = time.time()
 
         # High-priority Out-Of-Band (OOB) UDP Ping/Pong (zero queue delay!)
-        if decrypted.startswith(b"P2P_MC_OOB_PING:"):
-            pong_payload = decrypted[len(b"P2P_MC_OOB_PING:"):]
-            pong_pkt = self.cipher.encrypt(b"P2P_MC_OOB_PONG:" + pong_payload)
+        if decrypted.startswith(b"P2P_TUN_OOB_PING:"):
+            pong_payload = decrypted[len(b"P2P_TUN_OOB_PING:"):]
+            pong_pkt = self.cipher.encrypt(b"P2P_TUN_OOB_PONG:" + pong_payload)
             try:
                 self.udp_sock.sendto(pong_pkt, addr)
             except OSError:
                 pass
             return
 
-        if decrypted.startswith(b"P2P_MC_OOB_PONG:"):
-            pong_payload = decrypted[len(b"P2P_MC_OOB_PONG:"):]
+        if decrypted.startswith(b"P2P_TUN_OOB_PONG:"):
+            pong_payload = decrypted[len(b"P2P_TUN_OOB_PONG:"):]
             if len(pong_payload) >= 8:
                 orig_ts = struct.unpack("!d", pong_payload[:8])[0]
                 sample_rtt = max(0.5, (time.time() - orig_ts) * 1000.0)
-                if self.current_rtt_ms <= 0.0:
-                    self.current_rtt_ms = sample_rtt
+                if self.raw_rtt_ms <= 0.0:
+                    self.raw_rtt_ms = sample_rtt
                 else:
-                    self.current_rtt_ms = 0.7 * self.current_rtt_ms + 0.3 * sample_rtt
+                    self.raw_rtt_ms = 0.7 * self.raw_rtt_ms + 0.3 * sample_rtt
+                self.current_rtt_ms = self.raw_rtt_ms
                 if self.on_ping_update:
                     self.on_ping_update(self.current_rtt_ms)
             return
 
-        if decrypted.startswith(b"P2P_MC_OOB_MTU:"):
+        if decrypted.startswith(b"P2P_TUN_OOB_MTU:"):
             try:
-                req_mtu = int(decrypted[len(b"P2P_MC_OOB_MTU:"):].decode("ascii", errors="ignore").strip())
+                req_mtu = int(decrypted[len(b"P2P_TUN_OOB_MTU:"):].decode("ascii", errors="ignore").strip())
                 self.set_mtu(req_mtu, reason="Karşı uç VPN/MTU sinyali")
             except Exception:
                 pass
@@ -467,7 +480,7 @@ class P2PTunnel:
             self.peer_addr = addr
 
         # Filter residual hole-punching packets so they NEVER touch KCP!
-        if decrypted in (b"P2P_MC_PUNCH_SYN", b"P2P_MC_PUNCH_ACK") or decrypted.startswith(b"P2P_MC_PUNCH_"):
+        if decrypted in (b"P2P_TUN_PUNCH_SYN", b"P2P_TUN_PUNCH_ACK") or decrypted.startswith(b"P2P_TUN_PUNCH_"):
             return
 
         self.kcp.receive(decrypted)
@@ -482,6 +495,7 @@ class P2PTunnel:
         # Launch background tasks
         self.bg_tasks = [
             asyncio.create_task(self._kcp_update_loop()),
+            asyncio.create_task(self._inbound_processor_loop()),
             asyncio.create_task(self._kcp_sender_loop()),
             asyncio.create_task(self._ping_keepalive_loop()),
         ]
@@ -502,7 +516,11 @@ class P2PTunnel:
         try:
             self.outbound_queue.put_nowait(frame)
         except asyncio.QueueFull:
-            self.kcp.send(frame)
+            try:
+                loop = asyncio.get_running_loop()
+                loop.create_task(self.outbound_queue.put(frame))
+            except RuntimeError:
+                self.kcp.send(frame)
 
     async def enqueue_data_frame(self, frame: bytes):
         """Enqueues frame into strict FIFO queue with backpressure to eliminate bufferbloat."""
@@ -557,7 +575,7 @@ class P2PTunnel:
         if not self.running or not self.udp_sock or not self.peer_addr:
             return
         try:
-            pkt = self.cipher.encrypt(f"P2P_MC_OOB_MTU:{self.mtu}".encode("ascii"))
+            pkt = self.cipher.encrypt(f"P2P_TUN_OOB_MTU:{self.mtu}".encode("ascii"))
             self.udp_sock.sendto(pkt, self.peer_addr)
         except OSError:
             pass
@@ -565,22 +583,52 @@ class P2PTunnel:
     def send_auth(self):
         """Sends client authentication frame to server (including detected VPN/MTU state)."""
         if not self.is_server and not self.authenticated:
+            tok = self.auth_token
+            if not tok:
+                from core.protocol import DEFAULT_TOKEN
+                tok = DEFAULT_TOKEN
+
+            client_nonce = secrets.token_hex(16)
+            self._client_nonce = client_nonce
+
             if self.client_identity:
                 auth_data = dict(self.client_identity)
-                auth_data["token"] = self.auth_token
-                if not auth_data.get("version"):
-                    try:
-                        from core.updater import APP_VERSION
-                        auth_data["version"] = APP_VERSION
-                    except Exception:
-                        pass
             else:
                 try:
                     from core.updater import APP_VERSION
                     ver = APP_VERSION
                 except Exception:
                     ver = "2.6"
-                auth_data = {"token": self.auth_token, "version": ver}
+                auth_data = {"version": ver}
+
+            auth_data["nonce"] = client_nonce
+
+            # Protect admin secret: NEVER send plain admin token over the wire!
+            if tok and not tok.startswith(("tok_", "TOK_")):
+                # Admin Secret: Send HMAC challenge-response only!
+                auth_hmac = hmac.new(
+                    tok.encode("utf-8"),
+                    f"P2P_AUTH:{self.room_secret}:{client_nonce}".encode("utf-8"),
+                    hashlib.sha256
+                ).hexdigest()
+                auth_data["token_hmac"] = auth_hmac
+                auth_data["token"] = "HMAC_PROTECTED"
+            else:
+                # Player Token: Send token and HMAC
+                auth_hmac = hmac.new(
+                    tok.encode("utf-8"),
+                    f"P2P_AUTH:{self.room_secret}:{client_nonce}".encode("utf-8"),
+                    hashlib.sha256
+                ).hexdigest()
+                auth_data["token_hmac"] = auth_hmac
+                auth_data["token"] = tok
+
+            if not auth_data.get("version"):
+                try:
+                    from core.updater import APP_VERSION
+                    auth_data["version"] = APP_VERSION
+                except Exception:
+                    auth_data["version"] = "2.6"
 
             auth_data["mtu"] = self.mtu
             auth_data["vpn"] = self.is_vpn
@@ -603,6 +651,7 @@ class P2PTunnel:
     async def stop(self):
         """Gracefully closes all streams and stops loops WITHOUT touching the underlying UDP socket."""
         self.running = False
+        self._inbound_event.set()
         self._connecting_streams.clear()
         self._pending_stream_data.clear()
         for task in self.bg_tasks:
@@ -630,19 +679,36 @@ class P2PTunnel:
         """Runs the KCP clock every 5ms for minimal latency."""
         while self.running:
             self.kcp.update()
-            # Process received application data
+            has_chunk = False
             for chunk in self.kcp.get_received():
                 self.inbound_buffer.extend(chunk)
-                await self._process_inbound_buffer()
+                has_chunk = True
+            if has_chunk:
+                self._inbound_event.set()
             await asyncio.sleep(0.005)
+
+    async def _inbound_processor_loop(self):
+        """Processes assembled inbound KCP stream data into multiplexed protocol frames."""
+        while self.running:
+            try:
+                await self._inbound_event.wait()
+                self._inbound_event.clear()
+                await self._process_inbound_buffer()
+            except asyncio.CancelledError:
+                break
+            except Exception as e:
+                if not self.running:
+                    break
+                self.logger.debug(f"[INBOUND-PROC-ERR] {e}")
+                await asyncio.sleep(0.001)
 
     async def _ping_keepalive_loop(self):
         """Sends periodic high-priority UDP pings, monitors health, and adapts MTU if VPN state changes."""
         await asyncio.sleep(0.2)
         while self.running:
             now = time.time()
-            # Heartbeat watchdog: If peer is silent for > 6.0s once authenticated, disconnect cleanly
-            if self.authenticated and (now - self.last_inbound_time > 6.0):
+            # Heartbeat watchdog: If peer is silent for > 10.0s once authenticated, disconnect cleanly
+            if self.authenticated and (now - self.last_inbound_time > 10.0):
                 self.logger.warning(
                     f"Bağlantı zaman aşımı: Karşı taraftan {now - self.last_inbound_time:.1f} saniyedir yanıt alınamadı. Tünel sıfırlanıyor..."
                 )
@@ -655,6 +721,15 @@ class P2PTunnel:
             if self.is_server and not self.authenticated and (now - self.last_inbound_time > 12.0):
                 await self.stop()
                 break
+
+            # Aggressive OOB probe burst if silence exceeds 4.0s to revive NAT pinhole
+            if self.authenticated and (now - self.last_inbound_time > 4.0) and self.peer_addr:
+                ts_bytes = struct.pack("!d", now)
+                oob_ping = self.cipher.encrypt(b"P2P_TUN_OOB_PING:" + ts_bytes)
+                try:
+                    self.udp_sock.sendto(oob_ping, self.peer_addr)
+                except OSError:
+                    pass
 
             # Client-side live VPN/MTU watcher (every 3s): adapts automatically if user toggles VPN mid-session
             if not self.is_server and (now - self._last_mtu_check > 3.0):
@@ -669,7 +744,7 @@ class P2PTunnel:
             if self.authenticated and self.peer_addr:
                 ts_bytes = struct.pack("!d", now)
                 # Send Out-Of-Band (OOB) UDP Ping packet directly (bypasses KCP queues completely!)
-                oob_ping = self.cipher.encrypt(b"P2P_MC_OOB_PING:" + ts_bytes)
+                oob_ping = self.cipher.encrypt(b"P2P_TUN_OOB_PING:" + ts_bytes)
                 try:
                     self.udp_sock.sendto(oob_ping, self.peer_addr)
                 except OSError:
@@ -692,34 +767,71 @@ class P2PTunnel:
             await self._handle_frame(stream_id, cmd, target_port, payload)
 
     async def _connect_server_stream(self, stream_id: int, target_port: int):
-        """Asynchronously connects to local/LAN target port with strict timeout without blocking KCP loop."""
+        """Asynchronously connects to local target port without blocking KCP loop."""
         connected = False
-        hosts_to_try = []
-        cached_host = self._target_host_cache.get(target_port)
-        if cached_host:
-            hosts_to_try.append(cached_host)
-
-        for h in ["127.0.0.1", "192.168.1.1"]:
-            if h not in hosts_to_try:
-                hosts_to_try.append(h)
-
         reader = None
         writer = None
-        for host in hosts_to_try:
-            if not self.running or stream_id not in self._connecting_streams:
-                break
-            timeout_sec = 1.5 if host == "127.0.0.1" else 2.5
-            try:
-                reader, writer = await asyncio.wait_for(
-                    asyncio.open_connection(host, target_port),
-                    timeout=timeout_sec,
-                )
-                tune_tcp_socket(writer.get_extra_info("socket"))
-                self._target_host_cache[target_port] = host
-                connected = True
-                break
-            except Exception:
-                continue
+        target_host = self.target_host or "127.0.0.1"
+
+        if self.running and stream_id in self._connecting_streams:
+            if self.virtual_ip:
+                # 1. Try real virtual IP binding (100.0.0.x)
+                try:
+                    reader, writer = await asyncio.wait_for(
+                        asyncio.open_connection(target_host, target_port, local_addr=(self.virtual_ip, 0)),
+                        timeout=2.0,
+                    )
+                    tune_tcp_socket(writer.get_extra_info("socket"))
+                    connected = True
+                except (OSError, Exception):
+                    # 2. Smart loopback fallback (Windows / non-root Linux: e.g. 100.0.0.5 -> 127.100.0.5)
+                    fallback_ip = None
+                    try:
+                        v_parts = self.virtual_ip.split(".")
+                        if len(v_parts) == 4:
+                            fallback_ip = f"127.100.{v_parts[2]}.{v_parts[3]}"
+                    except Exception:
+                        fallback_ip = "127.100.0.2"
+
+                    if fallback_ip:
+                        try:
+                            reader, writer = await asyncio.wait_for(
+                                asyncio.open_connection(target_host, target_port, local_addr=(fallback_ip, 0)),
+                                timeout=2.0,
+                            )
+                            tune_tcp_socket(writer.get_extra_info("socket"))
+                            connected = True
+                        except Exception:
+                            # 3. Last resort: connect without local_addr
+                            try:
+                                reader, writer = await asyncio.wait_for(
+                                    asyncio.open_connection(target_host, target_port),
+                                    timeout=2.0,
+                                )
+                                tune_tcp_socket(writer.get_extra_info("socket"))
+                                connected = True
+                            except Exception as e_last:
+                                self.logger.error(f"Hedef porta bağlanılamadı ({target_host}:{target_port}): {e_last}")
+                    else:
+                        try:
+                            reader, writer = await asyncio.wait_for(
+                                asyncio.open_connection(target_host, target_port),
+                                timeout=2.0,
+                            )
+                            tune_tcp_socket(writer.get_extra_info("socket"))
+                            connected = True
+                        except Exception as e_last:
+                            self.logger.error(f"Hedef porta bağlanılamadı ({target_host}:{target_port}): {e_last}")
+            else:
+                try:
+                    reader, writer = await asyncio.wait_for(
+                        asyncio.open_connection(target_host, target_port),
+                        timeout=2.0,
+                    )
+                    tune_tcp_socket(writer.get_extra_info("socket"))
+                    connected = True
+                except Exception as e:
+                    self.logger.error(f"Hedef porta bağlanılamadı ({target_host}:{target_port}): {e}")
 
         if not self.running or stream_id not in self._connecting_streams:
             self._connecting_streams.discard(stream_id)
@@ -765,13 +877,15 @@ class P2PTunnel:
             if len(payload) >= 8:
                 orig_ts = struct.unpack("!d", payload[:8])[0]
                 sample_rtt = max(0.5, (time.time() - orig_ts) * 1000.0)
-                if self.current_rtt_ms <= 0.0:
-                    self.current_rtt_ms = sample_rtt
+                if self.app_rtt_ms <= 0.0:
+                    self.app_rtt_ms = sample_rtt
                 else:
-                    # Exponential Weighted Moving Average (EWMA) for smooth, jitter-free ping display
-                    self.current_rtt_ms = 0.75 * self.current_rtt_ms + 0.25 * sample_rtt
-                if self.on_ping_update:
-                    self.on_ping_update(self.current_rtt_ms)
+                    self.app_rtt_ms = 0.75 * self.app_rtt_ms + 0.25 * sample_rtt
+                # Only use app_rtt_ms for user display if raw UDP RTT is not available
+                if self.raw_rtt_ms <= 0.0:
+                    self.current_rtt_ms = self.app_rtt_ms
+                    if self.on_ping_update:
+                        self.on_ping_update(self.current_rtt_ms)
 
         elif cmd == Cmd.AUTH and self.is_server:
             raw_payload = payload.decode("utf-8", errors="ignore")
@@ -784,6 +898,8 @@ class P2PTunnel:
             client_version = ""
             client_mtu = 1350
             client_vpn = False
+            client_nonce = ""
+            token_hmac = ""
 
             try:
                 parsed = json.loads(raw_payload)
@@ -795,6 +911,8 @@ class P2PTunnel:
                     computer_name = parsed.get("computer_name", "")
                     os_info = parsed.get("os", "")
                     client_version = str(parsed.get("version", "")).strip()
+                    client_nonce = str(parsed.get("nonce", "")).strip()
+                    token_hmac = str(parsed.get("token_hmac", "")).strip()
                     if parsed.get("mtu"):
                         client_mtu = int(parsed.get("mtu"))
                     client_vpn = bool(parsed.get("vpn", False))
@@ -826,24 +944,55 @@ class P2PTunnel:
                 self.send_high_priority(resp)
                 return
 
-            self.logger.debug(f"İstemciden bağlantı isteği alındı: Kullanıcı={username}, Sürüm={client_version or 'Eski/Yok'}, MTU={self.mtu}, VPN={client_vpn}, HWID={hwid[:14]}...")
+            self.logger.debug(f"İstemciden bağlantı isteği alındı: Kullanıcı={username}, Sürüm={client_version or 'Eski/Yok'}, MTU={self.mtu}, VPN={client_vpn}")
             try:
-                role = self.acl.authenticate(token, hwid=hwid, hwid_details=hwid_details, client_version=client_version)
+                role = self.acl.authenticate(
+                    token,
+                    hwid=hwid,
+                    hwid_details=hwid_details,
+                    client_version=client_version,
+                    client_nonce=client_nonce,
+                    token_hmac=token_hmac,
+                    room_secret=self.room_secret,
+                )
                 self.peer_role = role
                 self.authenticated = True
                 self.client_info["role"] = role.name
+
+                # Generate mutual auth proof & per-session encryption key
+                server_nonce = secrets.token_hex(16)
+                proof_secret = self.acl.admin_secret.encode("utf-8") if role == Role.ADMIN else self.room_secret.encode("utf-8")
+                server_proof = hmac.new(
+                    proof_secret,
+                    f"P2P_SERVER_OK:{client_nonce}:{server_nonce}".encode("utf-8"),
+                    hashlib.sha256
+                ).hexdigest()
+
                 auth_ok_payload = json.dumps({
                     "port": getattr(self.acl, "allowed_game_port", 25565),
                     "address": getattr(self.acl, "connection_address", "baglanti.localhost"),
+                    "server_nonce": server_nonce,
+                    "server_proof": server_proof,
                 }, ensure_ascii=False).encode("utf-8")
                 resp = encode_frame(0, Cmd.AUTH_OK, target_port=int(role), payload=auth_ok_payload)
-                self.send_high_priority(resp)
-                self.logger.info(f"İstemci bağlandı: {username} ({self.peer_addr[0]}:{self.peer_addr[1]}) [Yetki: {role.name}, MTU: {self.mtu}]")
+                self.kcp.send(resp)
+                self.kcp.flush()
+                self.kcp.update()
+
+                # Set session key for isolated encryption after transmitting AUTH_OK with base key
+                if client_nonce and server_nonce:
+                    token_sec = self.acl.admin_secret if role == Role.ADMIN else self.room_secret
+                    session_key = derive_session_key(self.room_secret, client_nonce, server_nonce, token_sec)
+                    self.cipher.set_session_key(session_key)
+
                 if self.on_authenticated:
                     try:
                         self.on_authenticated(self.client_info)
                     except Exception:
                         pass
+
+                vip_str = f" -> Sanal IP: {self.virtual_ip}" if self.virtual_ip else ""
+                self.logger.info(f"İstemci bağlandı: {username} ({self.peer_addr[0]}:{self.peer_addr[1]}{vip_str}) [Yetki: {role.name}, MTU: {self.mtu}]")
                 if self.on_state_change:
                     self.on_state_change(f"İstemci bağlandı: {username} ({role.name})")
             except PermissionError as pe:
@@ -864,6 +1013,8 @@ class P2PTunnel:
             if not self.authenticated:
                 self.authenticated = True
                 self.peer_role = Role(target_port)
+                server_nonce = ""
+                server_proof = ""
                 if payload:
                     try:
                         meta = json.loads(payload.decode("utf-8", errors="ignore"))
@@ -872,8 +1023,33 @@ class P2PTunnel:
                                 self.server_assigned_port = int(meta["port"])
                             if meta.get("address"):
                                 self.server_assigned_address = str(meta["address"]).strip()
+                            server_nonce = meta.get("server_nonce", "")
+                            server_proof = meta.get("server_proof", "")
                     except Exception:
                         pass
+
+                # Mutual authentication & Session key derivation
+                client_nonce = getattr(self, "_client_nonce", "")
+                if server_nonce and server_proof and client_nonce:
+                    proof_secret = self.auth_token.encode("utf-8") if self.peer_role == Role.ADMIN and self.auth_token else self.room_secret.encode("utf-8")
+                    expected_proof = hmac.new(
+                        proof_secret,
+                        f"P2P_SERVER_OK:{client_nonce}:{server_nonce}".encode("utf-8"),
+                        hashlib.sha256
+                    ).hexdigest()
+                    if hmac.compare_digest(server_proof, expected_proof):
+                        token_sec = self.auth_token if self.peer_role == Role.ADMIN else self.room_secret
+                        session_key = derive_session_key(self.room_secret, client_nonce, server_nonce, token_sec)
+                        self.cipher.set_session_key(session_key)
+                        self.logger.debug(f"Oturum şifreleme anahtarı başarıyla kuruldu ({self.peer_role.name}).")
+                    else:
+                        self.logger.error("Sunucu kanıtı (proof) geçersiz! Olası sahte sunucu (rogue server) saldırısı tespit edildi.")
+                        self.auth_fail_reason = "Sahte sunucu (rogue server) algılandı!"
+                        if self.on_state_change:
+                            self.on_state_change(self.auth_fail_reason)
+                        await self.stop()
+                        return
+
                 self.logger.debug(f"Sunucu kimliğimizi onayladı. Rol: {self.peer_role.name}")
                 if self.on_state_change:
                     self.on_state_change("Kimlik doğrulandı")

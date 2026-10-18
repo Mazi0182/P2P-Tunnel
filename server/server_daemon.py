@@ -1,5 +1,5 @@
 r"""
-P2P_MC Server Daemon.
+P2P Tunnel Server Daemon.
 Headless background daemon for Ubuntu Server, OpenWrt (Pi 4), and Windows.
 Stores config persistently in C:\ProgramData\P2PTunnel.
 Displays clean, human-friendly short connection codes.
@@ -9,6 +9,7 @@ import asyncio
 import json
 import os
 import socket
+import subprocess
 import sys
 import secrets
 import string
@@ -26,8 +27,31 @@ from core.tunnel import P2PTunnel, disable_udp_connreset, tune_udp_socket
 from server.acl import ServerACL
 from server.web_panel import WebAdminPanel
 
-DEFAULT_SECRET = "sec_p2p_default_fallback"
-DEFAULT_TOKEN = "tok_p2p_player_fallback"
+DEFAULT_SECRET = "P2P_SHARED_SECRET_2026"
+DEFAULT_TOKEN = "P2P_PLAYER_SECRET_2026"
+
+
+def ensure_virtual_ip_subnet():
+    """Configures 100.0.0.0/16 in the Linux local route table for local virtual IP binding."""
+    if not sys.platform.startswith("linux"):
+        return
+    try:
+        res = subprocess.run(
+            ["ip", "route", "show", "table", "local"],
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+            timeout=2.0
+        )
+        if "100.0.0.0/16" in res.stdout or "100.0.0.0/24" in res.stdout:
+            return
+
+        cmd = ["ip", "route", "add", "local", "100.0.0.0/16", "dev", "lo"]
+        r = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, timeout=2.0)
+        if r.returncode != 0:
+            subprocess.run(["sudo", "-n"] + cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, timeout=2.0)
+    except Exception:
+        pass
 
 
 def generate_admin_secret(length: int = 20) -> str:
@@ -249,7 +273,8 @@ class P2PMCServer:
                 self.web_panel.panel_mode = disk_cfg["panel_mode"]
 
         disk_key = normalize_server_key(str(disk_cfg.get("server_key", "")))
-        if disk_key and disk_key != self.server_key:
+        clean_disk = disk_key.replace("-", "").replace(" ", "").upper()
+        if clean_disk and len(clean_disk) == 12 and disk_key != self.server_key:
             self.server_key = disk_key
             self.short_code = disk_key
             self.restart_signaling()
@@ -292,10 +317,14 @@ class P2PMCServer:
                 "room_secret": derived_room_sec,
             }
 
-        # Check and migrate legacy / missing server_key (strip MC- prefix)
-        server_key = normalize_server_key(cfg.get("server_key", ""))
-        if not server_key:
+        # Check and migrate legacy / missing server_key (upgrade 8-char keys to standard 12-char)
+        raw_key = str(cfg.get("server_key", "")).strip()
+        clean_key = raw_key.replace("-", "").replace(" ", "").upper()
+        if len(clean_key) != 12:
             server_key = generate_server_key()
+            server_logger.info(f"Eski/geçersiz bağlantı kodu ({raw_key or 'Yok'}) standart 12 karakterli yeni koda güncellendi: {server_key}")
+        else:
+            server_key = normalize_server_key(raw_key)
         cfg["server_key"] = server_key
 
         if not cfg.get("connection_address"):
@@ -304,9 +333,9 @@ class P2PMCServer:
         _, derived_room_sec, derived_player_tok = derive_credentials_from_key(server_key)
 
         # Migrate old static placeholder secrets to clean deterministic credentials
-        if cfg.get("player_token") in (None, "", "MC_PLAYER_SECRET_2026"):
+        if cfg.get("player_token") in (None, "", "MC_PLAYER_SECRET_2026", "P2P_PLAYER_SECRET_2026"):
             cfg["player_token"] = derived_player_tok
-        if cfg.get("room_secret") in (None, "", "P2P_MC_SHARED_SECRET_2026"):
+        if cfg.get("room_secret") in (None, "", "P2P_MC_SHARED_SECRET_2026", "P2P_SHARED_SECRET_2026"):
             cfg["room_secret"] = derived_room_sec
 
         # Check admin_secret
@@ -314,7 +343,7 @@ class P2PMCServer:
             cfg["admin_secret"] = admin_secret_override
         else:
             current_admin = cfg.get("admin_secret")
-            if not current_admin or current_admin == "MC_ADMIN_SUPER_SECRET_2026":
+            if not current_admin or current_admin in ("MC_ADMIN_SUPER_SECRET_2026", "P2P_ADMIN_SUPER_SECRET_2026"):
                 cfg["admin_secret"] = prompt_or_generate_admin_secret()
 
         # Check panel_mode ("standalone" or "mazipanel")
@@ -435,11 +464,13 @@ class P2PMCServer:
         tunnel = P2PTunnel(
             udp_sock=self.sock,
             peer_addr=addr,
-            cipher=self.cipher,
+            cipher=PacketCipher(derive_key(self.room_secret)),
             conv_id=2026,
             is_server=True,
             acl=self.acl,
             shared_socket=True,
+            room_secret=self.room_secret,
+            target_host="127.0.0.1",
         )
         tunnel.running = True
 
@@ -453,7 +484,12 @@ class P2PMCServer:
 
         def _on_tunnel_authenticated(client_info: dict):
             cur_addr = getattr(tunnel, "peer_addr", addr)
+            hwid = client_info.get("hwid", "")
+            username = client_info.get("username", "")
             if hasattr(self, "history_manager") and self.history_manager:
+                v_ip = self.history_manager.get_or_assign_virtual_ip(hwid, username)
+                tunnel.virtual_ip = v_ip
+                client_info["virtual_ip"] = v_ip
                 self.history_manager.record_login(client_info, cur_addr)
 
         tunnel.on_disconnect = _on_tunnel_disconnect
@@ -488,15 +524,35 @@ class P2PMCServer:
                         self.signaling.publish_nowait("server_hello", self.get_server_hello_payload())
             return
 
-        try:
-            decrypted = self.cipher.decrypt(data)
-        except Exception as e:
-            server_logger.debug(f"Paket çözülemedi ({addr}): {e}")
+        tunnel = self.clients.get(addr)
+        decrypted = None
+        if tunnel:
+            try:
+                decrypted = tunnel.cipher.decrypt(data)
+            except Exception:
+                decrypted = None
+
+        if decrypted is None:
+            try:
+                decrypted = self.cipher.decrypt(data)
+            except Exception:
+                decrypted = None
+
+        if decrypted is None:
+            # Check other client tunnels' ciphers (for roaming NAT from same client)
+            for t in self.clients.values():
+                try:
+                    decrypted = t.cipher.decrypt(data)
+                    break
+                except Exception:
+                    pass
+
+        if decrypted is None:
             return
 
         # Handle Hole-Punching probes
-        if decrypted in (b"P2P_MC_PUNCH_SYN", b"P2P_MC_PUNCH_ACK") or decrypted.startswith(b"P2P_MC_PUNCH_"):
-            punch_ack = self.cipher.encrypt(b"P2P_MC_PUNCH_ACK")
+        if decrypted in (b"P2P_TUN_PUNCH_SYN", b"P2P_TUN_PUNCH_ACK") or decrypted.startswith(b"P2P_TUN_PUNCH_"):
+            punch_ack = self.cipher.encrypt(b"P2P_TUN_PUNCH_ACK")
             for _ in range(4):
                 try:
                     self.sock.sendto(punch_ack, addr)
@@ -521,7 +577,7 @@ class P2PMCServer:
             ]
             if len(same_ip_tunnels) == 1:
                 is_mid_session = False
-                if decrypted.startswith((b"\xff\xffP2P_PING", b"\xff\xffP2P_PONG")):
+                if decrypted.startswith((b"P2P_TUN_OOB_PING:", b"P2P_TUN_OOB_PONG:", b"P2P_TUN_OOB_MTU:", b"\xff\xffP2P_PING", b"\xff\xffP2P_PONG")):
                     is_mid_session = True
                 elif len(decrypted) >= 24:
                     import struct
@@ -599,8 +655,8 @@ class P2PMCServer:
                 except OSError:
                     pass
 
-            # Refresh server endpoint signal periodically for new joining clients (every 20s)
-            if now - last_server_hello > 20.0:
+            # Refresh server endpoint signal periodically for new joining clients (every 900s / 15m to preserve ntfy quota)
+            if now - last_server_hello > 900.0:
                 last_server_hello = now
                 if self.signaling:
                     self.signaling.publish_nowait("server_hello", self.get_server_hello_payload())
@@ -612,7 +668,7 @@ class P2PMCServer:
 
             # Proactively punch towards active candidates that have not established an active tunnel yet
             if self.client_candidates:
-                punch_syn = self.cipher.encrypt(b"P2P_MC_PUNCH_SYN")
+                punch_syn = self.cipher.encrypt(b"P2P_TUN_PUNCH_SYN")
                 for cand in list(self.client_candidates.keys()):
                     if cand not in self.clients:
                         ip, port = cand
@@ -636,6 +692,7 @@ class P2PMCServer:
 
     async def run(self):
         server_logger.debug("P2P Sunucu Servisi Başlatılıyor...")
+        ensure_virtual_ip_subnet()
         self.setup_socket()
         self.discover_public_endpoint()
         self.sock.setblocking(False)
@@ -670,20 +727,21 @@ class P2PMCServer:
                 lport = msg.get("local_port")
                 cid = msg.get("client_id", "")
 
-                # If client shares the exact same public IP (Local LAN / Same NAT), prioritize LAN directly
+                # If client shares the exact same public IP (Local LAN / Same NAT), prioritize LAN directly,
+                # BUT ALWAYS ALSO record the WAN candidate to support CGNAT & VPN peers sharing the same external IP!
                 is_same_lan = bool(cip and self.public_endpoint and cip == self.public_endpoint[0])
-                if is_same_lan:
-                    if clan and lport:
-                        lan_addr = (clan, int(lport))
-                        self.client_candidates[lan_addr] = now_ts + 30.0
-                        server_logger.debug(f"İstemci yerel ağ adresi kaydedildi (Aynı Ağ): {clan}:{lport}")
-                elif cip and cport and cip != "127.0.0.1":
+                if is_same_lan and clan and lport:
+                    lan_addr = (clan, int(lport))
+                    self.client_candidates[lan_addr] = now_ts + 30.0
+                    server_logger.debug(f"İstemci yerel ağ adresi kaydedildi (Aynı Ağ): {clan}:{lport}")
+
+                if cip and cport and cip != "127.0.0.1":
                     wan_addr = (cip, int(cport))
                     self.client_candidates[wan_addr] = now_ts + 30.0
-                    server_logger.debug(f"İstemci dış bağlantı sinyali alındı: {cip}:{cport}")
+                    server_logger.debug(f"İstemci dış bağlantı sinyali kaydedildi: {cip}:{cport}")
                     # Immediate punch burst to open firewall pinholes without delay
                     try:
-                        punch_syn = self.cipher.encrypt(b"P2P_MC_PUNCH_SYN")
+                        punch_syn = self.cipher.encrypt(b"P2P_TUN_PUNCH_SYN")
                         self.sock.sendto(punch_syn, wan_addr)
                         for delta in range(-5, 41):
                             if delta == 0:

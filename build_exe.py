@@ -1,5 +1,5 @@
 """
-P2P_MC Standalone Executable Builder.
+P2P Tunnel Standalone Executable Builder.
 Uses --collect-all for kcp and cryptography to include all Cython .pyd and C extensions.
 """
 
@@ -149,7 +149,7 @@ def build_server():
 
 
 def main():
-    parser = argparse.ArgumentParser(description="P2P_MC Windows EXE Compiler")
+    parser = argparse.ArgumentParser(description="P2P Tunnel Windows EXE Compiler")
     parser.add_argument("--client", action="store_true", help="Build only Client GUI EXE")
     parser.add_argument("--server", action="store_true", help="Build only Server CLI EXE")
     parser.add_argument("--all", action="store_true", help="Build both Client and Server")

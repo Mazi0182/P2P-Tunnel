@@ -1410,8 +1410,10 @@ DASHBOARD_HTML = """<!DOCTYPE html>
     }
 
     function normalizeKeyDisplay(key) {
-      let clean = String(key || '').trim().toUpperCase();
-      if (clean.startsWith('MC-')) clean = clean.slice(3);
+      let clean = String(key || '').trim().replace(/[-\\s]/g, '').toUpperCase();
+      if (clean.length === 12) {
+        return clean.slice(0, 4) + '-' + clean.slice(4, 8) + '-' + clean.slice(8, 12);
+      }
       return clean || '----';
     }
 
@@ -1444,6 +1446,13 @@ DASHBOARD_HTML = """<!DOCTYPE html>
       if (!text || text === 'N/A' || text === '-') return;
       navigator.clipboard.writeText(text);
       showToast(`${label} panoya kopyalandı: ${text}`, 'success');
+    }
+
+    function copyTextBtn(el) {
+      if (!el || !el.dataset) return;
+      const text = el.dataset.copy || '';
+      const label = el.dataset.copyLabel || 'Değer';
+      copyText(text, label);
     }
 
     // 5. Custom Confirm Modal
@@ -1633,12 +1642,13 @@ DASHBOARD_HTML = """<!DOCTYPE html>
             <div style="font-size:10.5px;color:var(--text-tertiary);">${escapeHtml(c.os || '')}</div>
           </td>
           <td>
-            <span class="code-chip" onclick="copyText('${addrSafe}', 'IP Adresi')" title="Kopyalamak için tıklayın">
+            <span class="code-chip" data-copy="${addrSafe}" data-copy-label="IP Adresi" onclick="copyTextBtn(this)" title="Kopyalamak için tıklayın">
               ${addrSafe}
             </span>
+            ${c.virtual_ip ? `<div style="margin-top:3px;"><span class="badge badge-accent mono" style="font-size:10px;padding:2px 6px;" title="Sanal IP (Oyun İçi)">🌐 ${escapeHtml(c.virtual_ip)}</span></div>` : ''}
           </td>
           <td>
-            <span class="code-chip" onclick="copyText('${hwidSafe}', 'HWID')" title="${hwidSafe} (Kopyalamak için tıklayın)">
+            <span class="code-chip" data-copy="${hwidSafe}" data-copy-label="HWID" onclick="copyTextBtn(this)" title="${hwidSafe} (Kopyalamak için tıklayın)">
               ${escapeHtml(hwidShort)}
             </span>
           </td>
@@ -1652,8 +1662,8 @@ DASHBOARD_HTML = """<!DOCTYPE html>
           </td>
           <td style="text-align:right;">
             <div style="display:inline-flex;gap:5px;">
-              <button class="btn btn-secondary btn-xs" onclick="kickClient('${addrSafe}', '${userSafe}')">At</button>
-              <button class="btn btn-danger btn-xs" onclick="openBanModal('${userSafe}', '${hwidSafe}', '${addrSafe}', ${detailsSafe})">Yasakla</button>
+              <button class="btn btn-secondary btn-xs" data-addr="${addrSafe}" data-user="${userSafe}" onclick="kickClientBtn(this)">At</button>
+              <button class="btn btn-danger btn-xs" data-user="${userSafe}" data-hwid="${hwidSafe}" data-addr="${addrSafe}" data-details="${detailsSafe}" onclick="openBanModalBtn(this)">Yasakla</button>
             </div>
           </td>
         </tr>`;
@@ -1685,7 +1695,7 @@ DASHBOARD_HTML = """<!DOCTYPE html>
 
         const actionHtml = h.is_banned
           ? '<span class="badge badge-danger">YASAKLI</span>'
-          : `<button class="btn btn-danger btn-xs" onclick="openBanModal('${userSafe}', '${hwidSafe}', '${addrSafe}', ${detailsSafe})">Yasakla</button>`;
+          : `<button class="btn btn-danger btn-xs" data-user="${userSafe}" data-hwid="${hwidSafe}" data-addr="${addrSafe}" data-details="${detailsSafe}" onclick="openBanModalBtn(this)">Yasakla</button>`;
 
         return `<tr>
           <td>
@@ -1696,11 +1706,14 @@ DASHBOARD_HTML = """<!DOCTYPE html>
             <div style="font-size:10.5px;color:var(--text-tertiary);">${escapeHtml(h.computer_name || '-')} • ${h.login_count || 1} giriş</div>
           </td>
           <td>
-            <span class="code-chip" onclick="copyText('${hwidSafe}', 'HWID')" title="${hwidSafe}">
+            <span class="code-chip" data-copy="${hwidSafe}" data-copy-label="HWID" onclick="copyTextBtn(this)" title="${hwidSafe}">
               ${escapeHtml(hwidShort)}
             </span>
           </td>
-          <td class="mono" style="font-size:11.5px;color:var(--text-secondary);">${escapeHtml(h.ip || '-')}</td>
+          <td>
+            <div class="mono" style="font-size:11.5px;color:var(--text-secondary);">${escapeHtml(h.ip || '-')}</div>
+            ${h.virtual_ip ? `<div style="margin-top:3px;"><span class="badge badge-accent mono" style="font-size:10px;padding:2px 6px;" title="Sanal IP">🌐 ${escapeHtml(h.virtual_ip)}</span></div>` : ''}
+          </td>
           <td class="mono" style="font-size:11px;color:var(--text-tertiary);">${escapeHtml(h.last_seen || '-')}</td>
           <td style="text-align:right;">${actionHtml}</td>
         </tr>`;
@@ -1731,14 +1744,14 @@ DASHBOARD_HTML = """<!DOCTYPE html>
           return `<tr>
             <td><strong>${userSafe}</strong></td>
             <td>
-              <span class="code-chip" onclick="copyText('${hwidSafe}', 'HWID')" title="${hwidSafe}">
+              <span class="code-chip" data-copy="${hwidSafe}" data-copy-label="HWID" onclick="copyTextBtn(this)" title="${hwidSafe}">
                 ${escapeHtml(hwidShort)}
               </span>
             </td>
             <td style="color:var(--text-secondary);font-size:12px;">${escapeHtml(b.reason || '-')}</td>
             <td class="mono" style="color:var(--text-tertiary);font-size:11px;">${escapeHtml(b.banned_at || '-')}</td>
             <td style="text-align:right;">
-              <button class="btn btn-success btn-xs" onclick="unbanClient('${idSafe}', '${userSafe}')">Yasağı Kaldır</button>
+              <button class="btn btn-success btn-xs" data-id="${idSafe}" data-user="${userSafe}" onclick="unbanClientBtn(this)">Yasağı Kaldır</button>
             </td>
           </tr>`;
         }).join('');
@@ -1913,6 +1926,13 @@ DASHBOARD_HTML = """<!DOCTYPE html>
       if (el) el.type = el.type === 'password' ? 'text' : 'password';
     }
 
+    function kickClientBtn(btn) {
+      if (!btn || !btn.dataset) return;
+      const addr = btn.dataset.addr || '';
+      const user = btn.dataset.user || '';
+      kickClient(addr, user);
+    }
+
     async function kickClient(peerAddr, username) {
       const ok = await showConfirmModal(
         'Bağlantıyı Sonlandır (Kick)',
@@ -1939,6 +1959,20 @@ DASHBOARD_HTML = """<!DOCTYPE html>
       } catch (e) {
         showToast('İşlem başarısız.', 'error');
       }
+    }
+
+    function openBanModalBtn(btn) {
+      if (!btn || !btn.dataset) return;
+      const user = btn.dataset.user || '';
+      const hwid = btn.dataset.hwid || '';
+      const addr = btn.dataset.addr || '';
+      let details = {};
+      try {
+        details = JSON.parse(btn.dataset.details || '{}');
+      } catch (e) {
+        details = {};
+      }
+      openBanModal(user, hwid, addr, details);
     }
 
     function openBanModal(username, hwid, peerAddr, details) {
@@ -2011,6 +2045,13 @@ DASHBOARD_HTML = """<!DOCTYPE html>
       } catch (err) {
         showToast('İstek başarısız.', 'error');
       }
+    }
+
+    function unbanClientBtn(btn) {
+      if (!btn || !btn.dataset) return;
+      const id = btn.dataset.id || '';
+      const user = btn.dataset.user || '';
+      unbanClient(id, user);
     }
 
     async function unbanClient(banId, label) {
@@ -2815,6 +2856,7 @@ class WebAdminPanel:
                 "hwid_details": info.get("hwid_details") or {},
                 "os": info.get("os") or "Bilinmiyor",
                 "role": getattr(tunnel.peer_role, "name", "PLAYER") if tunnel.peer_role else "PLAYER",
+                "virtual_ip": getattr(tunnel, "virtual_ip", None) or info.get("virtual_ip", ""),
                 "ping_ms": round(getattr(tunnel, "current_rtt_ms", 0.0), 1),
                 "active_streams": len(getattr(tunnel, "streams", {})),
                 "local_ports": stream_local_ports,
@@ -3024,6 +3066,10 @@ class WebAdminPanel:
             from core.invite import derive_credentials_from_key, normalize_server_key
             from core.crypto import PacketCipher, derive_key
             norm_k = normalize_server_key(str(new_key))
+            clean_k = norm_k.replace("-", "").replace(" ", "").upper()
+            if len(clean_k) != 12:
+                self._send_json(writer, {"success": False, "message": "Geçersiz bağlantı kodu! Standart 12 karakterli (XXXX-XXXX-XXXX) olmalıdır."}, status=400)
+                return
             if norm_k != self.server.server_key:
                 key_changed = True
             self.server.server_key = norm_k
