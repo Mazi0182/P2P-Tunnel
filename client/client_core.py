@@ -451,14 +451,20 @@ class P2PMCClientCore:
 
             client_logger.debug(f"Kimlik doğrulama gönderiliyor... Kullanıcı={self.client_identity.get('username')}")
             for auth_attempt in range(80):
-                if self.tunnel.authenticated:
-                    client_logger.info(f"Tünel bağlantısı kuruldu. Yetki: {self.tunnel.peer_role.name}")
+                t = self.tunnel
+                if not t:
                     break
-                self.tunnel.send_auth()
+                if t.authenticated:
+                    client_logger.info(f"Tünel bağlantısı kuruldu. Yetki: {t.peer_role.name}")
+                    break
+                if getattr(t, "auth_fail_reason", "") or (auth_attempt > 0 and not t.running):
+                    break
+                if auth_attempt == 0 or auth_attempt % 4 == 0:
+                    t.send_auth()
                 await asyncio.sleep(0.12)
 
-            if not self.tunnel.authenticated:
-                fail_reason = getattr(self.tunnel, "auth_fail_reason", "")
+            if not self.tunnel or not self.tunnel.authenticated:
+                fail_reason = getattr(self.tunnel, "auth_fail_reason", "") if self.tunnel else ""
                 if fail_reason:
                     client_logger.error(f"Kimlik doğrulama reddedildi: {fail_reason}")
                     raise ConnectionError(fail_reason)
@@ -494,9 +500,24 @@ class P2PMCClientCore:
                 self.signaling = None
             await self._cleanup_resources()
             self.is_connected = False
-            self._set_state(f"Hata: {str(e)}")
+
+            err_text = str(e)
+            err_upper = err_text.upper()
+            is_permanent = any(kw in err_upper for kw in ("BANNED", "YASAKLANMIŞTIR", "OUTDATED", "GEÇERSIZ BAĞLANTI", "TANIMLANMAMIŞ"))
+
+            if not is_permanent and self._reconnect_attempts > 0 and self._reconnect_attempts < self._max_reconnect_attempts and not self._manual_disconnect:
+                self._reconnect_attempts += 1
+                retry_msg = f"Yeniden bağlanma denemesi ({self._reconnect_attempts}/{self._max_reconnect_attempts}): {err_text}..."
+                self._set_state(retry_msg)
+                client_logger.info(f"[AUTO-RECONNECT] {retry_msg}")
+                await asyncio.sleep(2.0)
+                if not self._manual_disconnect:
+                    self._reconnect_task = asyncio.create_task(self.connect_async())
+                return
+
+            self._set_state(f"Hata: {err_text}")
             if self.on_error:
-                self.on_error(str(e))
+                self.on_error(err_text)
 
     async def _cleanup_resources(self):
         """Immediately closes and releases all local proxies, sockets, and tunnel resources."""
@@ -527,6 +548,8 @@ class P2PMCClientCore:
             self.disconnect_event.set()
 
     def _on_remote_disconnect(self):
+        if not self.is_connected:
+            return
         if self.loop and self.loop.is_running():
             asyncio.run_coroutine_threadsafe(self._handle_unexpected_disconnect(), self.loop)
 

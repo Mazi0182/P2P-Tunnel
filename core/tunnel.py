@@ -81,12 +81,32 @@ _VPN_KEYWORDS = (
     "surfshark", "expressvpn", "cyberghost", "pia", "adguard", "hamachi",
     "radmin", "clash", "sing-box", "nekoray", "v2ray", "outline", "psiphon",
     "kaspersky", "bitdefender vpn", "avast secureline", "hide.me", "ivpn",
+    "softether", "sstp", "l2tp", "ikev2", "wan miniport", "amnezia",
+    "hiddify", "proxifier", "tun2socks", "shadowsocks", "xray", "trojan",
+    "goodbyedpi", "byedpi", "zapret", "ultrasurf", "hotspot shield",
+    "betternet", "urban", "zenmate", "browsec", "touch vpn", "planet vpn",
+    "octohide", "privado", "astrill", "vypr", "torguard", "airvpn",
+    "perfect privacy", "ovpn",
 )
 
 _LOCAL_BRIDGE_KEYWORDS = (
     "vethernet", "wsl", "hyper-v", "vmware", "virtualbox", "vboxnet",
     "docker", "bluetooth", "npcap", "loopback",
 )
+
+
+def _is_private_ip(ip_str: str) -> bool:
+    """Checks if IP belongs to private 10.0.0.0/8 or 172.16.0.0/12 ranges."""
+    try:
+        parts = [int(x) for x in ip_str.split(".")]
+        if len(parts) == 4:
+            if parts[0] == 10:
+                return True
+            if parts[0] == 172 and 16 <= parts[1] <= 31:
+                return True
+    except Exception:
+        pass
+    return False
 
 
 def _is_cgnat_or_tun_ip(ip_str: str) -> bool:
@@ -137,6 +157,9 @@ def detect_vpn_and_mtu(peer_ip: str = "8.8.8.8") -> Tuple[int, bool, str]:
     for lip in route_ips:
         if _is_cgnat_or_tun_ip(lip):
             return 1100, True, f"TUN/CGNAT Rotasi ({lip})"
+
+    if len(route_ips) > 1:
+        return 1100, True, f"Coklu Aktif Rota/VPN Algilandi ({', '.join(sorted(route_ips))})"
 
     # 2. Windows Kernel Adapter Inspection via iphlpapi.GetAdaptersAddresses
     if sys.platform == "win32":
@@ -233,12 +256,13 @@ def detect_vpn_and_mtu(peer_ip: str = "8.8.8.8") -> Tuple[int, bool, str]:
                     has_vpn_keyword = any(kw in combined for kw in _VPN_KEYWORDS)
                     has_cgnat_ip = any(_is_cgnat_or_tun_ip(ip_s) for ip_s in ips)
                     has_low_mtu = iface_mtu < 1480
+                    is_virtual_non_standard = (int(a.IfType) not in (6, 71)) and any(_is_private_ip(ip_s) for ip_s in ips)
 
-                    if is_active_route and (is_tunnel_iftype or has_vpn_keyword or has_cgnat_ip or has_low_mtu):
+                    if is_active_route and (is_tunnel_iftype or has_vpn_keyword or has_cgnat_ip or has_low_mtu or is_virtual_non_standard):
                         kcp_mtu = min(1100, max(900, iface_mtu - 120)) if iface_mtu < 1220 else 1100
                         return kcp_mtu, True, f"{fname or desc} (Arayuz MTU={iface_mtu})"
 
-                    if is_tunnel_iftype or has_vpn_keyword or has_cgnat_ip or (has_low_mtu and int(a.IfType) not in (6, 71)):
+                    if is_tunnel_iftype or has_vpn_keyword or has_cgnat_ip or is_virtual_non_standard or (has_low_mtu and int(a.IfType) not in (6, 71)):
                         kcp_mtu = min(1100, max(900, iface_mtu - 120)) if iface_mtu < 1220 else 1100
                         return kcp_mtu, True, f"{fname or desc} (Arayuz MTU={iface_mtu})"
         except Exception:
@@ -309,9 +333,10 @@ class P2PTunnel:
         self.client_info: Dict[str, Any] = {}
         self.auth_fail_reason = ""
         self.logger = server_logger if is_server else client_logger
-        self.running = bool(shared_socket)
+        self.running = bool(shared_socket or udp_sock)
         self.authenticated = False
         self.peer_role: Optional[Role] = None
+        self._sent_nonces: set = set()
         self.raw_rtt_ms = 0.0
         self.app_rtt_ms = 0.0
         self.current_rtt_ms = 0.0
@@ -588,8 +613,14 @@ class P2PTunnel:
                 from core.protocol import DEFAULT_TOKEN
                 tok = DEFAULT_TOKEN
 
-            client_nonce = secrets.token_hex(16)
-            self._client_nonce = client_nonce
+            if not getattr(self, "_client_nonce", None):
+                client_nonce = secrets.token_hex(16)
+                self._client_nonce = client_nonce
+                if not hasattr(self, "_sent_nonces"):
+                    self._sent_nonces = set()
+                self._sent_nonces.add(client_nonce)
+            else:
+                client_nonce = self._client_nonce
 
             if self.client_identity:
                 auth_data = dict(self.client_identity)
@@ -936,10 +967,33 @@ class P2PTunnel:
             }
 
             if self.authenticated and self.peer_role:
-                auth_ok_payload = json.dumps({
+                s_nonce = getattr(self, "_server_nonce", "")
+                s_proof = getattr(self, "_server_proof", "")
+
+                if client_nonce:
+                    if client_nonce == getattr(self, "_last_client_nonce", "") and s_nonce and s_proof:
+                        pass
+                    else:
+                        s_nonce = s_nonce or secrets.token_hex(16)
+                        self._server_nonce = s_nonce
+                        self._last_client_nonce = client_nonce
+                        proof_secret = self.acl.admin_secret.encode("utf-8") if self.peer_role == Role.ADMIN else self.room_secret.encode("utf-8")
+                        s_proof = hmac.new(
+                            proof_secret,
+                            f"P2P_SERVER_OK:{client_nonce}:{s_nonce}".encode("utf-8"),
+                            hashlib.sha256
+                        ).hexdigest()
+                        self._server_proof = s_proof
+
+                auth_ok_dict = {
                     "port": getattr(self.acl, "allowed_game_port", 25565),
                     "address": getattr(self.acl, "connection_address", "baglanti.localhost"),
-                }, ensure_ascii=False).encode("utf-8")
+                }
+                if s_nonce and s_proof:
+                    auth_ok_dict["server_nonce"] = s_nonce
+                    auth_ok_dict["server_proof"] = s_proof
+
+                auth_ok_payload = json.dumps(auth_ok_dict, ensure_ascii=False).encode("utf-8")
                 resp = encode_frame(0, Cmd.AUTH_OK, target_port=int(self.peer_role), payload=auth_ok_payload)
                 self.send_high_priority(resp)
                 return
@@ -967,6 +1021,10 @@ class P2PTunnel:
                     f"P2P_SERVER_OK:{client_nonce}:{server_nonce}".encode("utf-8"),
                     hashlib.sha256
                 ).hexdigest()
+
+                self._server_nonce = server_nonce
+                self._server_proof = server_proof
+                self._last_client_nonce = client_nonce
 
                 auth_ok_payload = json.dumps({
                     "port": getattr(self.acl, "allowed_game_port", 25565),
@@ -1029,17 +1087,31 @@ class P2PTunnel:
                         pass
 
                 # Mutual authentication & Session key derivation
-                client_nonce = getattr(self, "_client_nonce", "")
-                if server_nonce and server_proof and client_nonce:
+                candidate_nonces = []
+                curr_c_nonce = getattr(self, "_client_nonce", "")
+                if curr_c_nonce:
+                    candidate_nonces.append(curr_c_nonce)
+                for sn in getattr(self, "_sent_nonces", set()):
+                    if sn not in candidate_nonces:
+                        candidate_nonces.append(sn)
+
+                if server_nonce and server_proof and candidate_nonces:
                     proof_secret = self.auth_token.encode("utf-8") if self.peer_role == Role.ADMIN and self.auth_token else self.room_secret.encode("utf-8")
-                    expected_proof = hmac.new(
-                        proof_secret,
-                        f"P2P_SERVER_OK:{client_nonce}:{server_nonce}".encode("utf-8"),
-                        hashlib.sha256
-                    ).hexdigest()
-                    if hmac.compare_digest(server_proof, expected_proof):
+                    matched_nonce = None
+                    for c_nonce in candidate_nonces:
+                        expected_proof = hmac.new(
+                            proof_secret,
+                            f"P2P_SERVER_OK:{c_nonce}:{server_nonce}".encode("utf-8"),
+                            hashlib.sha256
+                        ).hexdigest()
+                        if hmac.compare_digest(server_proof, expected_proof):
+                            matched_nonce = c_nonce
+                            break
+
+                    if matched_nonce:
+                        self._client_nonce = matched_nonce
                         token_sec = self.auth_token if self.peer_role == Role.ADMIN else self.room_secret
-                        session_key = derive_session_key(self.room_secret, client_nonce, server_nonce, token_sec)
+                        session_key = derive_session_key(self.room_secret, matched_nonce, server_nonce, token_sec)
                         self.cipher.set_session_key(session_key)
                         self.logger.debug(f"Oturum şifreleme anahtarı başarıyla kuruldu ({self.peer_role.name}).")
                     else:

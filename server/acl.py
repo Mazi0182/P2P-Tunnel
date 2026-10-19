@@ -10,7 +10,8 @@ Enforces strict role boundaries and hardware ban policies:
 from collections import deque
 import hashlib
 import hmac
-from typing import Optional, Set, Any
+import time
+from typing import Optional, Set, Dict, Tuple, Any
 from core.protocol import Role
 from server.ban_manager import BanManager
 
@@ -33,7 +34,7 @@ class ServerACL:
         self.connection_address = (connection_address or "baglanti.localhost").strip()
         self.ban_manager = ban_manager or BanManager()
         self.version_manager = version_manager
-        self._used_nonces: deque = deque(maxlen=1000)
+        self._used_nonces: Dict[str, Tuple[float, str]] = {}
         self._used_nonces_set: Set[str] = set()
 
     def add_player_token(self, token: str):
@@ -54,7 +55,7 @@ class ServerACL:
         """
         Verifies authentication, checks bans, validates client version, and assigns Role.
         - Supports cryptographic HMAC challenge-response to prevent token exposure even to rogue servers.
-        - Replay attack mitigation via rolling nonce cache.
+        - Replay attack mitigation via rolling nonce cache with idempotent retry window.
         - HWID ban enforcement via BanManager.
         - Strict version enforcement via VersionManager.
         """
@@ -67,16 +68,25 @@ class ServerACL:
             hwid_details = hwid_det_val
             client_version = actual_ver
 
-        # 1. Replay Protection: Nonce must be unique per connection
+        # 1. Replay Protection: Nonce must be unique per connection, with idempotent retry allowance
         if client_nonce:
             client_nonce_str = str(client_nonce).strip()
-            if client_nonce_str in self._used_nonces_set:
-                raise PermissionError("REPLAY_DETECTED: Tekrar eden bağlantı isteği engellendi.")
-            if len(self._used_nonces) >= 1000:
-                old_nonce = self._used_nonces.popleft()
-                self._used_nonces_set.discard(old_nonce)
-            self._used_nonces.append(client_nonce_str)
-            self._used_nonces_set.add(client_nonce_str)
+            now = time.time()
+            if len(self._used_nonces) > 1000:
+                cutoff = now - 60.0
+                self._used_nonces = {k: v for k, v in self._used_nonces.items() if v[0] > cutoff}
+                self._used_nonces_set = set(self._used_nonces.keys())
+
+            hwid_key = str(hwid or "").strip()
+            if client_nonce_str in self._used_nonces:
+                seen_time, seen_hwid = self._used_nonces[client_nonce_str]
+                if (not hwid_key or not seen_hwid or seen_hwid == hwid_key) and (now - seen_time) <= 10.0:
+                    pass
+                else:
+                    raise PermissionError("REPLAY_DETECTED: Tekrar eden bağlantı isteği engellendi.")
+            else:
+                self._used_nonces[client_nonce_str] = (now, hwid_key)
+                self._used_nonces_set.add(client_nonce_str)
 
         # 2. Enforce HWID & Multi-Hardware Ban Check (if provided)
         if hwid or hwid_details:

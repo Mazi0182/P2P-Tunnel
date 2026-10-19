@@ -18,7 +18,7 @@ from typing import Optional, Callable, Dict, Any
 logger = logging.getLogger("P2P_Updater")
 
 # Current application semantic version
-APP_VERSION = "4.0"
+APP_VERSION = "4.1"
 
 # Public R2 Update Endpoint
 DEFAULT_UPDATE_URL = "https://updates.mazidev.xyz/version.json"
